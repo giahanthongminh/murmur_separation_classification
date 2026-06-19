@@ -19,7 +19,7 @@ DATA_ROOT = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.0.3
 wav_dir   = DATA_ROOT / "training_data"
 tsv_dir   = DATA_ROOT / "training_data"   # TSV files live alongside WAVs
 output_dir = DATA_ROOT / "output"
-labels_path = DATA_ROOT / "labels.csv"
+labels_path = DATA_ROOT / "training_data.csv"
 
 
 def get_systolic_segments(tsv_path, sr):
@@ -82,7 +82,9 @@ if __name__ == "__main__":
 
     # Only process patients that have labels (skip the other ~2600 files)
     labels = pd.read_csv(labels_path)
-    patient_ids = set(labels["Patient ID"].astype(str))
+    # Only process patients with a known Systolic murmur timing label
+    labeled = labels[labels["Systolic murmur timing"].notna()]
+    patient_ids = set(labeled["Patient ID"].astype(str))
     files = [f for f in wav_dir.glob("*.wav")
              if f.stem.split("_")[0] in patient_ids]
 

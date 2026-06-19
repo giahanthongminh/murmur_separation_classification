@@ -138,6 +138,7 @@ def print_summary(results):
 def main():
     orig_csv = DATA_ROOT / "features_v2_original.csv"
     sep_csv  = DATA_ROOT / "features_v2_separated.csv"
+    # Note: labels come from training_data.csv (not labels.csv) in dataset v1.0.3
 
     missing = [p for p in [orig_csv, sep_csv] if not p.exists()]
     if missing:
