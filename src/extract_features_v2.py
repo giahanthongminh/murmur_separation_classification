@@ -24,7 +24,7 @@ from pathlib import Path
 
 from feature_utils import extract_all_features
 
-DATA_ROOT  = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
+DATA_ROOT  = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.0.3")
 LABELS_CSV = DATA_ROOT / "labels.csv"
 WAV_DIR    = DATA_ROOT / "training_data"   # original WAVs + TSV files
 OUTPUT_DIR = DATA_ROOT / "output"          # murmur_separated.wav files
