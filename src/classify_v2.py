@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.model_selection import GroupShuffleSplit, GridSearchCV
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
@@ -213,7 +213,7 @@ def resample(X_train, y_train):
         counts_u = pd.Series(y_u).value_counts()
         majority_n = counts_u.max()
         over_strategy = {
-            cls: max(cnt, majority_n)
+            cls: max(cnt, majority_n // 2)
             for cls, cnt in counts_u.items()
             if cnt < majority_n
         }
@@ -318,6 +318,20 @@ def get_models_fast():
     """Without MLP — for quick runs."""
     models = get_models()
     models.pop("MLP + Focal Loss", None)
+
+    # Soft-voting ensemble of all base models
+    def make_voting():
+        estimators = [
+            ("svm", SVC(kernel="rbf", class_weight="balanced", C=50,
+                        gamma="scale", random_state=RANDOM_STATE, probability=True)),
+            ("rf",  RandomForestClassifier(n_estimators=300, class_weight="balanced_subsample",
+                                           random_state=RANDOM_STATE, n_jobs=-1)),
+            ("gb",  GradientBoostingClassifier(n_estimators=200, max_depth=4,
+                                               learning_rate=0.05, random_state=RANDOM_STATE)),
+        ]
+        return VotingClassifier(estimators=estimators, voting="soft", n_jobs=-1)
+
+    models["Voting Ensemble"] = make_voting
     return models
 
 
