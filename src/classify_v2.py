@@ -309,6 +309,15 @@ def get_models():
         models["MLP + Focal Loss"] = lambda: TorchMLPClassifier(
             n_epochs=50, lr=0.001, gamma=2.0,
             random_state=RANDOM_STATE)
+
+    return models
+
+
+def get_models_fast():
+    """Without MLP — for quick runs."""
+    models = get_models()
+    models.pop("MLP + Focal Loss", None)
+    return models
     return models
 
 
@@ -347,7 +356,7 @@ def main():
             print(f"  {p}")
         return
 
-    models = get_models()
+    models = get_models_fast()  # swap to get_models() to include MLP
     results = {}
 
     for condition, csv_path in [("Original WAV", orig_csv),
