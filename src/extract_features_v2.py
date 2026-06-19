@@ -178,9 +178,38 @@ def save(df, path):
     print(f"Feature count: {n_feats}")
 
 
+def build_combined(orig_csv, sep_csv):
+    """
+    Merge original and separated feature CSVs on (patient_id, location).
+    For every feature column f, produces:
+      f_orig  — value from original WAV
+      f_sep   — value from separated murmur
+      f_diff  — f_sep - f_orig  (what separation changed)
+
+    Only rows present in BOTH CSVs are kept.
+    Output: features_v2_combined.csv with ~726 features.
+    """
+    df_o = pd.read_csv(orig_csv)
+    df_s = pd.read_csv(sep_csv)
+
+    meta = ["patient_id", "location", "label"]
+    feat_cols = [c for c in df_o.columns if c not in meta]
+
+    df_o = df_o.rename(columns={c: f"{c}_orig" for c in feat_cols})
+    df_s = df_s.rename(columns={c: f"{c}_sep"  for c in feat_cols})
+
+    merged = pd.merge(df_o, df_s, on=meta, how="inner")
+
+    for c in feat_cols:
+        merged[f"{c}_diff"] = merged[f"{c}_sep"] - merged[f"{c}_orig"]
+
+    return merged
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--condition", choices=["all", "original", "separated"],
+    parser.add_argument("--condition",
+                        choices=["all", "original", "separated", "combined"],
                         default="all")
     args = parser.parse_args()
 
@@ -199,6 +228,16 @@ def main():
         print("\n=== Condition B: Separated Murmur (per-cycle systole) ===")
         df_sep = extract_condition_separated(labels_df)
         save(df_sep, FEAT_DIR / "features_v2_separated.csv")
+
+    if args.condition in ("all", "combined"):
+        orig_csv = FEAT_DIR / "features_v2_original.csv"
+        sep_csv  = FEAT_DIR / "features_v2_separated.csv"
+        if orig_csv.exists() and sep_csv.exists():
+            print("\n=== Condition C: Combined (Original + Separated + Diff) ===")
+            df_comb = build_combined(orig_csv, sep_csv)
+            save(df_comb, FEAT_DIR / "features_v2_combined.csv")
+        else:
+            print("[WARN] Run --condition all first to generate orig/sep CSVs")
 
 
 if __name__ == "__main__":

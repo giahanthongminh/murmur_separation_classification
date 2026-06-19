@@ -318,28 +318,45 @@ def get_models_fast():
     models = get_models()
     models.pop("MLP + Focal Loss", None)
     return models
-    return models
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
 
 def print_summary(results):
     model_names = list(next(iter(results.values())).keys())
-    print("\n" + "=" * 80)
+    condition_names = list(results.keys())
+
+    print("\n" + "=" * 90)
     print("SUMMARY  (Late-systolic dropped | top-80 features | undersample+SMOTE)")
     print(f"  Primary metric: F1 macro\n")
-    print(f"{'Model':25s} {'Metric':12s} {'Original':>10s} {'Separated':>10s} {'Δ':>8s}")
-    print("-" * 80)
+
+    header = f"{'Model+Metric':35s}"
+    for cond in condition_names:
+        short = cond[:14]
+        header += f" {short:>14s}"
+    print(header)
+    print("-" * 90)
+
     for name in model_names:
         for metric in ["f1_macro", "accuracy"]:
-            o = results["Original WAV"].get(name, {}).get(metric)
-            s = results["Separated Murmur"].get(name, {}).get(metric)
-            if o is None or s is None:
-                continue
-            delta = s - o
-            sign = "+" if delta >= 0 else ""
             label = f"{name} {metric}"
-            print(f"  {label:33s} {o:>10.2f}%  {s:>10.2f}%  ({sign}{delta:.2f}%)")
+            row = f"  {label:33s}"
+            vals = []
+            for cond in condition_names:
+                v = results[cond].get(name, {}).get(metric)
+                if v is not None:
+                    row += f"  {v:>12.2f}%"
+                    vals.append(v)
+                else:
+                    row += f"  {'N/A':>12s}"
+            # Show delta: Combined vs Original
+            if len(vals) == len(condition_names) and "Combined (Orig+Sep+Diff)" in condition_names:
+                o = results["Original WAV"].get(name, {}).get(metric, 0)
+                c = results["Combined (Orig+Sep+Diff)"].get(name, {}).get(metric, 0)
+                delta = c - o
+                sign = "+" if delta >= 0 else ""
+                row += f"  (Comb vs Orig: {sign}{delta:.2f}%)"
+            print(row)
         print()
 
 
@@ -348,19 +365,32 @@ def print_summary(results):
 def main():
     orig_csv = DATA_ROOT / "features_v2_original.csv"
     sep_csv  = DATA_ROOT / "features_v2_separated.csv"
+    comb_csv = DATA_ROOT / "features_v2_combined.csv"
 
-    missing = [p for p in [orig_csv, sep_csv] if not p.exists()]
-    if missing:
-        print("Missing CSVs — run extract_features_v2.py first:")
-        for p in missing:
-            print(f"  {p}")
-        return
+    # Auto-build combined CSV if missing
+    if not comb_csv.exists():
+        if orig_csv.exists() and sep_csv.exists():
+            print("Building combined feature CSV...")
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from extract_features_v2 import build_combined
+            df_comb = build_combined(orig_csv, sep_csv)
+            df_comb.to_csv(comb_csv, index=False)
+            print(f"Saved {len(df_comb)} rows → {comb_csv}")
+        else:
+            print("Missing CSVs — run extract_features_v2.py first")
+            return
 
-    models = get_models_fast()  # swap to get_models() to include MLP
+    models = get_models_fast()
     results = {}
 
-    for condition, csv_path in [("Original WAV", orig_csv),
-                                  ("Separated Murmur", sep_csv)]:
+    conditions = [
+        ("Original WAV",             orig_csv),
+        ("Separated Murmur",         sep_csv),
+        ("Combined (Orig+Sep+Diff)", comb_csv),
+    ]
+
+    for condition, csv_path in conditions:
         X, y, groups, feat_cols = load(csv_path)
         print(f"\n{'='*60}")
         print(f"Condition: {condition}")
