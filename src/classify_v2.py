@@ -329,7 +329,7 @@ def get_models_fast():
             ("gb",  GradientBoostingClassifier(n_estimators=200, max_depth=4,
                                                learning_rate=0.05, random_state=RANDOM_STATE)),
         ]
-        return VotingClassifier(estimators=estimators, voting="soft", n_jobs=-1)
+        return VotingClassifier(estimators=estimators, voting="soft")
 
     models["Voting Ensemble"] = make_voting
     return models
