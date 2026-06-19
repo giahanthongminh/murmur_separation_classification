@@ -55,7 +55,7 @@ DATA_ROOT    = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.
 N_SPLITS     = 10
 TEST_SIZE    = 0.2
 RANDOM_STATE = 42
-N_FEATURES   = 80
+N_FEATURES   = 150
 DROP_CLASSES = {"Late-systolic"}
 
 
@@ -202,7 +202,7 @@ def resample(X_train, y_train):
         minority_n = counts.min()
         # Undersample: cap majority at 5× minority
         under_strategy = {
-            cls: min(cnt, minority_n * 5)
+            cls: min(cnt, minority_n * 8)
             for cls, cnt in counts.items()
         }
         under = RandomUnderSampler(sampling_strategy=under_strategy,
@@ -213,7 +213,7 @@ def resample(X_train, y_train):
         counts_u = pd.Series(y_u).value_counts()
         majority_n = counts_u.max()
         over_strategy = {
-            cls: max(cnt, majority_n // 2)
+            cls: max(cnt, majority_n)
             for cls, cnt in counts_u.items()
             if cnt < majority_n
         }
@@ -288,10 +288,11 @@ def evaluate(model_name, model_fn, X, y, groups):
 def get_models():
     models = {
         "SVM": lambda: SVC(kernel="rbf", class_weight="balanced",
-                           C=10, gamma="scale",
+                           C=50, gamma="scale",
                            random_state=RANDOM_STATE, probability=True),
         "Random Forest": lambda: RandomForestClassifier(
-            n_estimators=200, class_weight="balanced",
+            n_estimators=300, class_weight="balanced_subsample",
+            max_features="sqrt", min_samples_leaf=1,
             random_state=RANDOM_STATE, n_jobs=-1),
         "Gradient Boosting": lambda: GradientBoostingClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05,
