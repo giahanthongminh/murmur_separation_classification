@@ -1,69 +1,50 @@
-'''
-ssa:
-1. ssa decomposition
-2. turn signal into components:
+# ssa.py
+# Singular Spectrum Analysis (SSA) decomposition
+# Decomposes a 1D signal into components via SVD of the trajectory matrix
 
-- component 0:
-+ usually strongest pattern
-+ often main heart rhythm (S1/S2)
-
-- component 1,2:
-+ similar patterns but slightly different
-+ can capture: repeated beats + variations + noise / murmur parts
-'''
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
 
 def embed_signal(signal, L):
     """
-    Turn 1D signal into a matrix of overlapping windows.
-
-    Each column is a shifted version of the signal.
+    Build L×K trajectory (Hankel) matrix using zero-copy sliding windows.
+    L = window length, K = N - L + 1
     """
-    N = len(signal)
-    K = N - L + 1
-
-    # Stack sliding windows column-wise
-    return np.column_stack([signal[i:i+L] for i in range(K)])
+    return sliding_window_view(signal, L).T
 
 
 def diagonal_averaging(X):
     """
-    Convert SSA matrix back into a 1D signal.
-
-    This averages along diagonals to reconstruct time series.
+    Convert SSA component matrix back to 1D signal by averaging anti-diagonals.
+    Vectorized: O(L) Python iterations instead of O(L×K).
     """
     L, K = X.shape
     N = L + K - 1
-
     result = np.zeros(N)
-    count = np.zeros(N)
-
-    # Accumulate values along diagonals
+    counts = np.zeros(N)
     for i in range(L):
-        for j in range(K):
-            result[i + j] += X[i, j]
-            count[i + j] += 1
-
-    # Average overlapping contributions
-    return result / count
+        result[i:i+K] += X[i]   # vectorized numpy add across row i
+        counts[i:i+K] += 1
+    return result / counts
 
 
-def ssa_decompose(signal, L):
-    """Decompose signal into SSA components."""
-
-    print("Building trajectory matrix...")
+def ssa_decompose(signal, L, n_components=20):
+    """
+    Decompose signal into SSA components.
+    Only reconstructs n_components (default 20) to avoid unnecessary work —
+    CSSA only needs the top few components to separate heart sound from murmur.
+    """
     X = embed_signal(signal, L)
 
-    print("Running SVD...")
+    # SVD of trajectory matrix
     U, S, VT = np.linalg.svd(X, full_matrices=False)
 
-    print("Reconstructing components...")
+    k = n_components or len(S)
     components = []
-
-    for i in range(len(S)):
+    for i in range(k):
+        # Rank-1 reconstruction for component i
         Xi = S[i] * np.outer(U[:, i], VT[i, :])
-        comp = diagonal_averaging(Xi)
-        components.append(comp)
+        components.append(diagonal_averaging(Xi))
 
-    print("Done.")
     return np.array(components)
