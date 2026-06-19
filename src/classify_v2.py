@@ -26,7 +26,7 @@ except ImportError:
     HAS_SMOTE = False
     print("[INFO] imbalanced-learn not installed — running without SMOTE")
 
-DATA_ROOT = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.0.3")
+DATA_ROOT = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.0.1")
 
 N_SPLITS   = 10
 TEST_SIZE  = 0.2

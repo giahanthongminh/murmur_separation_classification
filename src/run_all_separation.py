@@ -15,7 +15,7 @@ from cssa import compare_cssa_methods
 from dwt_refine import dwt_refine
 from multiprocessing import Pool
 
-DATA_ROOT = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.0.3")
+DATA_ROOT = Path("/Users/danggiahan/physionet.org/files/circor-heart-sound/1.0.1")
 wav_dir   = DATA_ROOT / "training_data"
 tsv_dir   = DATA_ROOT / "training_data"   # TSV files live alongside WAVs
 output_dir = DATA_ROOT / "output"
