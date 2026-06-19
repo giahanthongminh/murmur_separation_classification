@@ -307,7 +307,7 @@ def get_models():
             random_state=RANDOM_STATE, n_jobs=-1)
     if HAS_TORCH:
         models["MLP + Focal Loss"] = lambda: TorchMLPClassifier(
-            n_epochs=150, lr=0.001, gamma=2.0,
+            n_epochs=50, lr=0.001, gamma=2.0,
             random_state=RANDOM_STATE)
     return models
 
