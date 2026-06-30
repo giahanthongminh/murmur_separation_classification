@@ -38,8 +38,18 @@ IMG_W   = 224
 
 
 def mel_spectrogram(signal, sr):
+    # Replace NaN/Inf from imperfect CSSA+DWT separation
+    signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
+    # n_fft must not exceed signal length
+    n_fft = min(N_FFT, len(signal))
+    # n_fft must be even and at least 2
+    if n_fft < 2:
+        n_fft = 2
+    elif n_fft % 2 != 0:
+        n_fft -= 1
+    hop = min(HOP, n_fft // 2)
     mel = librosa.feature.melspectrogram(
-        y=signal, sr=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP)
+        y=signal, sr=sr, n_mels=N_MELS, n_fft=n_fft, hop_length=hop)
     mel_db = librosa.power_to_db(mel, ref=np.max)
     return mel_db   # shape: (N_MELS, T)
 
@@ -95,6 +105,9 @@ for seg_folder in sorted(seg_dir.iterdir()):
 
         if len(signal) < 64:
             continue
+
+        if not np.all(np.isfinite(signal)):
+            signal = np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
 
         mel_db = mel_spectrogram(signal, SR)
         arr3   = to_image(mel_db)
