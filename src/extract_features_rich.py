@@ -1,7 +1,12 @@
 # extract_features_rich.py
-# Extract rich temporal + spectral features from separated murmur WAV files
+# Extract rich temporal + spectral features from separated murmur segments
 # Key addition: energy profile across systole segments — directly encodes timing
+#
+# Reads per-segment murmur arrays produced by run_separation_per_segment.py
+# (CSSA+DWT run on each systolic segment individually, preserving inter-beat
+# timing), rather than a whole-recording separation.
 
+import json
 import pandas as pd
 import numpy as np
 import librosa
@@ -10,10 +15,10 @@ from scipy.stats import skew, kurtosis
 
 DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
 labels_path   = DATA_ROOT / "labels.csv"
-output_dir    = DATA_ROOT / "output"
-tsv_dir       = DATA_ROOT / "training_data"
+output_dir    = DATA_ROOT / "output_per_seg"
 features_path = DATA_ROOT / "features_rich.csv"
 
+SR = 4000
 N_ENERGY_SEGMENTS = 10  # split systole into 10 segments → RMS per segment
 
 
@@ -92,6 +97,25 @@ def extract_features(signal, sr):
     return features
 
 
+def load_systole_signal(patient_id, location):
+    """Concatenate per-segment separated murmur arrays in timing order."""
+    folder = output_dir / f"{patient_id}_{location}"
+    meta_path = folder / "segments_meta.json"
+    if not meta_path.exists():
+        return None
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    segments = []
+    for entry in sorted(meta, key=lambda m: m["seg_idx"]):
+        seg_path = folder / f"seg_{entry['seg_idx']}_murmur.npy"
+        if seg_path.exists():
+            segments.append(np.load(seg_path))
+
+    return np.concatenate(segments) if segments else None
+
+
 labels = pd.read_csv(labels_path)
 rows = []
 
@@ -100,30 +124,12 @@ for _, row in labels.iterrows():
     label = row["Systolic murmur timing"]
 
     for location in ["AV", "PV", "TV", "MV"]:
-        wav_path = output_dir / f"{patient_id}_{location}" / "murmur_separated.wav"
-        tsv_path = tsv_dir / f"{patient_id}_{location}.tsv"
+        systole_signal = load_systole_signal(patient_id, location)
 
-        if not wav_path.exists() or not tsv_path.exists():
+        if systole_signal is None or len(systole_signal) < 100:
             continue
 
-        signal, sr = librosa.load(wav_path, sr=4000)
-
-        # Crop to systolic segments only
-        tsv = pd.read_csv(tsv_path, sep="\t", header=None,
-                          names=["start", "end", "label"])
-        systole = tsv[tsv["label"] == 2]
-
-        if len(systole) == 0:
-            continue
-
-        segments = [signal[int(s*sr):int(e*sr)]
-                    for _, (s, e, _) in systole.iterrows()]
-        systole_signal = np.concatenate(segments)
-
-        if len(systole_signal) < 100:
-            continue
-
-        feats = extract_features(systole_signal, sr)
+        feats = extract_features(systole_signal, SR)
         feats["patient_id"] = patient_id
         feats["label"] = label
         rows.append(feats)
