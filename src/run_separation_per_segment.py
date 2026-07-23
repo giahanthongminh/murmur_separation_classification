@@ -44,7 +44,7 @@ def separate_segment(seg_signal):
     if len(seg_signal) < MIN_SEG_SAMPLES:
         return None
     result = compare_cssa_methods(seg_signal, L=min(100, len(seg_signal) // 4),
-                                  zcr_threshold=0.05, top_k=5)
+                                  zcr_threshold=0.05)
     refined_normal = dwt_refine(result["best_normal"])
     # Align length (DWT waverec can add 1 sample)
     n = len(seg_signal)

@@ -1,10 +1,14 @@
 '''
 CSSA-ZCR
-CSSA-kurtosis
+CSSA-kurtosis (GA-optimized joint selection)
 Compare methods (correlation)
 Outputs:
 - normal sound
 - murmur
+
+Implements the CSSA stage of Qi & Sanei, "Murmur Separation and Classification
+from Heart Sound Using Constrained Singular Spectrum Analysis and Wavelet
+Transform," APSIPA ASC 2024.
 '''
 
 import numpy as np
@@ -59,22 +63,65 @@ def kurtosis_score(signal):
     return np.mean(z ** 4) - 3
 
 
-def cssa_kurtosis(signal, L, top_k=5):
+def cssa_kurtosis(signal, L, pop_size=30, n_generations=40,
+                   mutation_rate=0.05, random_state=42):
     """
-    Reconstruct normal heart sound using high-kurtosis components.
+    Reconstruct normal heart sound by selecting the subset of SSA components
+    W in {0,1}^d that maximizes kurtosis(R @ W).
+
+    This is a nonlinear integer programming problem (the objective depends on
+    the *combined* reconstructed signal, not on each component independently),
+    so it's solved with a Genetic Algorithm rather than ranking components by
+    their individual kurtosis.
     Murmur is the residual.
     """
     components = ssa_decompose(signal, L)
+    d = components.shape[0]
+    rng = np.random.default_rng(random_state)
 
-    kurt_values = []
-    for comp in components:
-        kurt_values.append(kurtosis_score(comp))
+    kurt_values = [kurtosis_score(comp) for comp in components]
 
-    # Pick the top-k most peaky components
-    ranked = np.argsort(kurt_values)[::-1]
-    selected = ranked[:top_k]
+    def fitness(w):
+        if not w.any():
+            return -np.inf
+        return kurtosis_score(w @ components)
 
-    normal_reconstructed = np.sum(components[selected], axis=0)
+    population = rng.integers(0, 2, size=(pop_size, d)).astype(np.int8)
+    best_w, best_fit = None, -np.inf
+
+    for _ in range(n_generations):
+        fitness_vals = np.array([fitness(w) for w in population])
+
+        gen_best_idx = np.argmax(fitness_vals)
+        if fitness_vals[gen_best_idx] > best_fit:
+            best_fit = fitness_vals[gen_best_idx]
+            best_w = population[gen_best_idx].copy()
+
+        # Elitism + tournament selection + uniform crossover + mutation
+        next_population = [best_w.copy()]
+        while len(next_population) < pop_size:
+            i, j = rng.integers(0, pop_size, size=2)
+            parent1 = population[i] if fitness_vals[i] > fitness_vals[j] else population[j]
+            i, j = rng.integers(0, pop_size, size=2)
+            parent2 = population[i] if fitness_vals[i] > fitness_vals[j] else population[j]
+
+            mask = rng.integers(0, 2, size=d).astype(bool)
+            child = np.where(mask, parent1, parent2)
+
+            flip = rng.random(d) < mutation_rate
+            child = np.where(flip, 1 - child, child).astype(np.int8)
+
+            next_population.append(child)
+
+        population = np.array(next_population[:pop_size])
+
+    if best_w is None or not best_w.any():
+        normal_reconstructed = np.zeros_like(signal)
+        selected = np.array([], dtype=int)
+    else:
+        normal_reconstructed = best_w @ components
+        selected = np.flatnonzero(best_w)
+
     murmur = signal - normal_reconstructed
 
     return normal_reconstructed, murmur, selected, kurt_values
@@ -90,14 +137,12 @@ def correlation_score(x, y):
     return np.corrcoef(x, y)[0, 1]
 
 
-def compare_cssa_methods(signal, L, zcr_threshold=0.05, top_k=5):
+def compare_cssa_methods(signal, L, zcr_threshold=0.05):
     """Run both CSSA methods and keep the one with lower correlation."""
     normal_zcr, murmur_zcr, selected_zcr, zcr_values = cssa_zcr(
         signal, L, zcr_threshold=zcr_threshold
     )
-    normal_kurt, murmur_kurt, selected_kurt, kurt_values = cssa_kurtosis(
-        signal, L, top_k=top_k
-    )
+    normal_kurt, murmur_kurt, selected_kurt, kurt_values = cssa_kurtosis(signal, L)
 
     corr_zcr = correlation_score(normal_zcr, murmur_zcr)
     corr_kurt = correlation_score(normal_kurt, murmur_kurt)

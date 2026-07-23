@@ -24,9 +24,11 @@ from sklearn.metrics import (accuracy_score, f1_score,
 from sklearn.preprocessing import LabelEncoder
 from pathlib import Path
 
-DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-spec_dir  = DATA_ROOT / "spectrograms_dl"
-csv_path  = DATA_ROOT / "labels_dl.csv"
+DATA_ROOT    = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
+spec_dir     = DATA_ROOT / "spectrograms_dl"          # separated murmur
+spec_dir_ori = DATA_ROOT / "spectrograms_original"    # original WAV
+csv_path     = DATA_ROOT / "labels_dl.csv"
+csv_path_ori = DATA_ROOT / "labels_original.csv"
 
 BATCH     = 32
 EPOCHS_FROZEN   = 5    # train only FC while backbone frozen
@@ -46,15 +48,16 @@ print(f"Device: {device}")
 # Dataset
 # ---------------------------------------------------------------------------
 class SegmentDataset(Dataset):
-    def __init__(self, keys, labels):
-        self.keys   = keys
-        self.labels = labels
+    def __init__(self, keys, labels, data_dir):
+        self.keys     = keys
+        self.labels   = labels
+        self.data_dir = Path(data_dir)
 
     def __len__(self):
         return len(self.keys)
 
     def __getitem__(self, idx):
-        arr = np.load(spec_dir / f"{self.keys[idx]}.npy")   # (3,224,224) float32
+        arr = np.load(self.data_dir / f"{self.keys[idx]}.npy")  # (3,224,224)
         x = torch.from_numpy(arr)
         y = torch.tensor(self.labels[idx], dtype=torch.long)
         return x, y
@@ -114,7 +117,7 @@ def predict(model, loader):
 # ---------------------------------------------------------------------------
 # Main evaluation loop
 # ---------------------------------------------------------------------------
-def evaluate(df):
+def evaluate(df, data_dir):
     le     = LabelEncoder()
     keys   = df["key"].values
     y      = le.fit_transform(df["label"].values)
@@ -128,8 +131,8 @@ def evaluate(df):
         y_train = y[tr]
         cw = class_weights(y_train)
 
-        train_ds = SegmentDataset(keys[tr], y_train)
-        test_ds  = SegmentDataset(keys[te], y[te])
+        train_ds = SegmentDataset(keys[tr], y_train, data_dir)
+        test_ds  = SegmentDataset(keys[te], y[te],   data_dir)
         train_dl = DataLoader(train_ds, batch_size=BATCH, shuffle=True,
                               num_workers=0, pin_memory=False)
         test_dl  = DataLoader(test_ds,  batch_size=BATCH,
@@ -171,11 +174,23 @@ def evaluate(df):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    df = pd.read_csv(csv_path)
-    print(f"Total segments: {len(df)}")
-    print(df["label"].value_counts())
+    # --- Baseline: Original WAV (no separation) ---
+    if csv_path_ori.exists():
+        df_ori = pd.read_csv(csv_path_ori)
+        print(f"\nOriginal WAV segments: {len(df_ori)}")
+        print(df_ori["label"].value_counts())
+        print("\n" + "="*55)
+        print("ResNet18 — ORIGINAL WAV (no separation) [baseline]")
+        print("="*55)
+        evaluate(df_ori, spec_dir_ori)
+    else:
+        print("labels_original.csv not found — run generate_spectrograms_original.py first")
 
+    # --- Proposed: Separated Murmur ---
+    df_sep = pd.read_csv(csv_path)
+    print(f"\nSeparated murmur segments: {len(df_sep)}")
+    print(df_sep["label"].value_counts())
     print("\n" + "="*55)
-    print("ResNet18 Transfer Learning — Per-Segment Separated Murmur")
+    print("ResNet18 — SEPARATED MURMUR (proposed pipeline)")
     print("="*55)
-    evaluate(df)
+    evaluate(df_sep, spec_dir)

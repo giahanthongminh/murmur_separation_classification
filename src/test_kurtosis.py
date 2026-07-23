@@ -9,7 +9,7 @@ file = list(wav_dir.glob("*.wav"))[0]
 signal, sr = librosa.load(file, sr=4000)
 signal = signal[:4000]
 
-normal, murmur, selected, kurt_values = cssa_kurtosis(signal, L=100, top_k=5)
+normal, murmur, selected, kurt_values = cssa_kurtosis(signal, L=100)
 
 print("Selected components:", selected)
 print("Number selected:", len(selected))
