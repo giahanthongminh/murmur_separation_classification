@@ -50,7 +50,7 @@ def process_file(file):
         return None
 
     # Stage 1: CSSA — compare ZCR and kurtosis methods, keep lower correlation
-    result = compare_cssa_methods(signal, L=100, zcr_threshold=0.05, top_k=5)
+    result = compare_cssa_methods(signal, L=100, zcr_threshold=0.05)
     best_normal = result["best_normal"]
 
     # Stage 2: DWT refinement — remove residual murmur from normal sound

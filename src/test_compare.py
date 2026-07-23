@@ -9,7 +9,7 @@ file = list(wav_dir.glob("*.wav"))[0]
 signal, sr = librosa.load(file, sr=4000)
 signal = signal[:4000]
 
-result = compare_cssa_methods(signal, L=100, zcr_threshold=0.05, top_k=5)
+result = compare_cssa_methods(signal, L=100, zcr_threshold=0.05)
 
 print("Best method:", result["best_method"])
 print("corr_zcr:", result["corr_zcr"])
