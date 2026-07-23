@@ -47,23 +47,38 @@ N_DIAGNOSTIC_SAMPLES = 15
 RANDOM_SEED = 42
 
 
+SEGMENT_TYPES = ["systole", "diastole"]
+
+
+def segment_folder(patient_id, location, segment_type):
+    """Systole lives directly under <patient>_<loc>/ (original flat layout);
+    diastole lives in a <patient>_<loc>/diastole/ subfolder."""
+    base = output_dir / f"{patient_id}_{location}"
+    return base if segment_type == "systole" else base / segment_type
+
+
 def list_segments():
-    """Yield (patient_id, location, seg_idx, t_start, t_end, duration) for
-    every segment already separated by run_separation_per_segment.py."""
+    """Yield (patient_id, location, segment_type, seg_idx, t_start, t_end,
+    duration) for every segment already separated by
+    run_separation_per_segment.py, across both systole and diastole."""
     for folder in sorted(output_dir.iterdir()):
         if not folder.is_dir() or folder.name == "diagnostics":
             continue
-        meta_path = folder / "segments_meta.json"
-        if not meta_path.exists():
-            continue
 
         patient_id, location = folder.name.rsplit("_", 1)
-        with open(meta_path) as f:
-            meta = json.load(f)
 
-        for entry in meta:
-            yield (patient_id, location, entry["seg_idx"],
-                   entry["t_start"], entry["t_end"], entry["duration"])
+        for segment_type in SEGMENT_TYPES:
+            type_folder = segment_folder(patient_id, location, segment_type)
+            meta_path = type_folder / "segments_meta.json"
+            if not meta_path.exists():
+                continue
+
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+            for entry in meta:
+                yield (patient_id, location, segment_type, entry["seg_idx"],
+                       entry["t_start"], entry["t_end"], entry["duration"])
 
 
 def load_raw_segment(patient_id, location, t_start, t_end):
@@ -113,8 +128,8 @@ def selected_component_energy_center(components, selected, n):
     return float(np.mean(fracs)) if fracs else np.nan
 
 
-def compute_segment_metrics(patient_id, location, seg_idx, t_start, t_end):
-    murmur_path = output_dir / f"{patient_id}_{location}" / f"seg_{seg_idx}_murmur.npy"
+def compute_segment_metrics(patient_id, location, segment_type, seg_idx, t_start, t_end):
+    murmur_path = segment_folder(patient_id, location, segment_type) / f"seg_{seg_idx}_murmur.npy"
     if not murmur_path.exists():
         return None
 
@@ -157,17 +172,18 @@ def build_metrics_csv(force=False):
         return pd.read_csv(metrics_path)
 
     rows = []
-    for patient_id, location, seg_idx, t_start, t_end, duration in list_segments():
+    for patient_id, location, segment_type, seg_idx, t_start, t_end, duration in list_segments():
         try:
-            metrics = compute_segment_metrics(patient_id, location, seg_idx, t_start, t_end)
+            metrics = compute_segment_metrics(patient_id, location, segment_type,
+                                               seg_idx, t_start, t_end)
         except Exception as e:
-            print(f"Skipping {patient_id}_{location} seg{seg_idx}: {e}")
+            print(f"Skipping {patient_id}_{location} {segment_type} seg{seg_idx}: {e}")
             continue
         if metrics is None:
             continue
 
-        row = {"patient_id": patient_id, "location": location, "seg_idx": seg_idx,
-               "t_start": t_start, "t_end": t_end, "duration": duration}
+        row = {"patient_id": patient_id, "location": location, "segment_type": segment_type,
+               "seg_idx": seg_idx, "t_start": t_start, "t_end": t_end, "duration": duration}
         row.update(metrics)
         rows.append(row)
 
@@ -179,8 +195,9 @@ def build_metrics_csv(force=False):
 
 
 def join_patient_metadata(df):
-    """Pull Systolic murmur pitch/grading from the full training_data.csv —
-    labels.csv (via prepare_labels.py) only keeps Patient ID + timing."""
+    """Pull Systolic/Diastolic murmur pitch/grading from the full
+    training_data.csv — labels.csv (via prepare_labels.py) only keeps
+    Patient ID + systolic timing."""
     raw_path = DATA_ROOT / "training_data.csv"
     if not raw_path.exists():
         print(f"Warning: {raw_path} not found, skipping pitch/grading join.")
@@ -191,13 +208,15 @@ def join_patient_metadata(df):
     raw["patient_id"] = raw["patient_id"].astype(str)
     df["patient_id"] = df["patient_id"].astype(str)
 
-    cols = ["patient_id", "Systolic murmur pitch", "Systolic murmur grading"]
+    cols = ["patient_id",
+            "Systolic murmur pitch", "Systolic murmur grading",
+            "Diastolic murmur pitch", "Diastolic murmur grading"]
     cols = [c for c in cols if c in raw.columns]
     return df.merge(raw[cols], on="patient_id", how="left")
 
 
-def plot_segment_diagnostics(patient_id, location, seg_idx, t_start, t_end):
-    murmur_path = output_dir / f"{patient_id}_{location}" / f"seg_{seg_idx}_murmur.npy"
+def plot_segment_diagnostics(patient_id, location, segment_type, seg_idx, t_start, t_end):
+    murmur_path = segment_folder(patient_id, location, segment_type) / f"seg_{seg_idx}_murmur.npy"
     seg_signal = load_raw_segment(patient_id, location, t_start, t_end)
     if seg_signal is None or not murmur_path.exists() or len(seg_signal) < MIN_SEG_SAMPLES:
         return
@@ -212,7 +231,7 @@ def plot_segment_diagnostics(patient_id, location, seg_idx, t_start, t_end):
     gs = gridspec.GridSpec(5, 2, height_ratios=[1, 1, 1, 1, 1.6], figure=fig)
 
     waveforms = [
-        ("Original segment", seg_signal),
+        (f"Original segment ({segment_type})", seg_signal),
         (f"CSSA normal ({result['best_method']})", normal),
         ("DWT-refined normal", refined_normal),
         ("Final murmur", final_murmur),
@@ -242,23 +261,26 @@ def plot_segment_diagnostics(patient_id, location, seg_idx, t_start, t_end):
     ax2.set_title("Spectrogram: final murmur", fontsize=9)
     fig.colorbar(img, ax=[ax1, ax2], format="%+2.0f dB")
 
-    fig.savefig(diag_dir / f"{patient_id}_{location}_seg{seg_idx}.png", dpi=100)
+    fig.savefig(diag_dir / f"{patient_id}_{location}_{segment_type}_seg{seg_idx}.png", dpi=100)
     plt.close(fig)
 
 
 def save_diagnostic_samples(df, n=N_DIAGNOSTIC_SAMPLES, seed=RANDOM_SEED):
+    """Sample across (patient, segment_type) pairs so both systole and
+    diastole get diagnostic coverage, not just whichever comes first."""
     diag_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
 
-    unique_patients = df["patient_id"].unique()
-    chosen_patients = rng.choice(unique_patients, size=min(n, len(unique_patients)), replace=False)
+    pairs = df[["patient_id", "segment_type"]].drop_duplicates().values
+    chosen = pairs[rng.choice(len(pairs), size=min(n, len(pairs)), replace=False)]
 
-    for p in chosen_patients:
-        row = df[df["patient_id"] == p].sample(1, random_state=seed).iloc[0]
-        plot_segment_diagnostics(row["patient_id"], row["location"], int(row["seg_idx"]),
-                                  row["t_start"], row["t_end"])
+    for patient_id, segment_type in chosen:
+        sub = df[(df["patient_id"] == patient_id) & (df["segment_type"] == segment_type)]
+        row = sub.sample(1, random_state=seed).iloc[0]
+        plot_segment_diagnostics(row["patient_id"], row["location"], row["segment_type"],
+                                  int(row["seg_idx"]), row["t_start"], row["t_end"])
 
-    print(f"Saved {len(chosen_patients)} diagnostic figures -> {diag_dir}")
+    print(f"Saved {len(chosen)} diagnostic figures -> {diag_dir}")
 
 
 def plot_correlation_histograms(df):
@@ -268,9 +290,14 @@ def plot_correlation_histograms(df):
     ax.set_xlabel("correlation between reconstructed-normal and murmur residual")
     ax.set_ylabel("count")
 
-    method_pct = df["method_chosen"].value_counts(normalize=True) * 100
-    note = ", ".join(f"{m}: {p:.1f}%" for m, p in method_pct.items())
-    ax.set_title(f"Correlation scores by method (chosen split — {note})")
+    notes = []
+    for segment_type in SEGMENT_TYPES:
+        sub = df[df["segment_type"] == segment_type]
+        if len(sub) == 0:
+            continue
+        method_pct = sub["method_chosen"].value_counts(normalize=True) * 100
+        notes.append(segment_type + ": " + ", ".join(f"{m} {p:.0f}%" for m, p in method_pct.items()))
+    ax.set_title("Correlation scores by method (chosen split — " + "; ".join(notes) + ")")
     ax.legend()
     fig.tight_layout()
     fig.savefig(diag_dir / "hist_correlation.png", dpi=100)
@@ -279,10 +306,18 @@ def plot_correlation_histograms(df):
 
 def plot_energy_ratio_histogram(df):
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.hist(df["energy_ratio_murmur"].dropna(), bins=30)
+    plotted = False
+    for segment_type in SEGMENT_TYPES:
+        vals = df.loc[df["segment_type"] == segment_type, "energy_ratio_murmur"].dropna()
+        if len(vals) == 0:
+            continue
+        ax.hist(vals, bins=30, alpha=0.6, label=segment_type)
+        plotted = True
     ax.set_xlabel("RMS(final murmur) / RMS(original segment)")
     ax.set_ylabel("count")
     ax.set_title("Energy ratio: separated murmur vs. original segment")
+    if plotted:
+        ax.legend()
     fig.tight_layout()
     fig.savefig(diag_dir / "hist_energy_ratio.png", dpi=100)
     plt.close(fig)
@@ -290,56 +325,75 @@ def plot_energy_ratio_histogram(df):
 
 def plot_component_energy_center_histogram(df):
     fig, ax = plt.subplots(figsize=(7, 5))
-    vals = df["selected_component_energy_center_frac"].dropna()
-    ax.hist(vals, bins=30, range=(0, 1))
+    plotted = False
+    for segment_type in SEGMENT_TYPES:
+        vals = df.loc[df["segment_type"] == segment_type,
+                      "selected_component_energy_center_frac"].dropna()
+        if len(vals) == 0:
+            continue
+        ax.hist(vals, bins=30, range=(0, 1), alpha=0.6, label=segment_type)
+        plotted = True
     ax.axvline(0.5, color="red", linestyle="--", linewidth=1)
     ax.set_xlabel("energy-weighted mean time of 'normal' component (fraction of segment)")
     ax.set_ylabel("count")
     ax.set_title("Where the 'normal' component's energy sits in the segment\n"
                   "(near 0/1 = edge leakage from S1/S2, near 0.5 = no real structure found)")
+    if plotted:
+        ax.legend()
     fig.tight_layout()
     fig.savefig(diag_dir / "hist_component_energy_center.png", dpi=100)
     plt.close(fig)
 
 
-def plot_pitch_vs_centroid(df):
-    if "Systolic murmur pitch" not in df.columns:
-        print("Skipping scatter_pitch_vs_centroid.png: pitch column not joined.")
+SEGMENT_TYPE_ADJECTIVE = {"systole": "Systolic", "diastole": "Diastolic"}
+
+
+def plot_pitch_vs_centroid(df, segment_type):
+    pitch_col = f"{SEGMENT_TYPE_ADJECTIVE[segment_type]} murmur pitch"
+    if pitch_col not in df.columns:
+        print(f"Skipping scatter_pitch_vs_centroid_{segment_type}.png: {pitch_col} not joined.")
         return
 
+    sub = df[df["segment_type"] == segment_type]
     order = ["Low", "Medium", "High"]
-    present = [p for p in order if (df["Systolic murmur pitch"] == p).any()]
-    groups = [df.loc[df["Systolic murmur pitch"] == p, "spectral_centroid_murmur"].dropna()
-              for p in present]
+    present = [p for p in order if (sub[pitch_col] == p).any()]
+    groups = [sub.loc[sub[pitch_col] == p, "spectral_centroid_murmur"].dropna() for p in present]
     if not groups:
-        print("Skipping scatter_pitch_vs_centroid.png: no pitch labels present.")
+        print(f"Skipping scatter_pitch_vs_centroid_{segment_type}.png: no pitch labels present.")
         return
 
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.boxplot(groups, tick_labels=present)
-    ax.set_ylabel("Spectral centroid of separated murmur (Hz)")
-    ax.set_xlabel("Systolic murmur pitch")
-    ax.set_title("Murmur spectral centroid by annotated pitch")
+    ax.set_ylabel(f"Spectral centroid of separated {segment_type} murmur (Hz)")
+    ax.set_xlabel(pitch_col)
+    ax.set_title(f"{SEGMENT_TYPE_ADJECTIVE[segment_type]} murmur spectral centroid by annotated pitch")
     fig.tight_layout()
-    fig.savefig(diag_dir / "scatter_pitch_vs_centroid.png", dpi=100)
+    fig.savefig(diag_dir / f"scatter_pitch_vs_centroid_{segment_type}.png", dpi=100)
     plt.close(fig)
 
 
 def print_summary(df):
     print(f"\nTotal segments: {len(df)}")
+    print(df["segment_type"].value_counts().to_string())
 
-    method_pct = df["method_chosen"].value_counts(normalize=True) * 100
-    print("Method chosen split:")
-    for m, p in method_pct.items():
-        print(f"  {m}: {p:.1f}%")
-
-    for col in ["corr_zcr", "corr_kurt", "energy_ratio_murmur",
-                "kurtosis_before", "kurtosis_after", "spectral_centroid_murmur",
-                "selected_component_energy_center_frac"]:
-        vals = df[col].dropna()
-        if len(vals) == 0:
+    for segment_type in SEGMENT_TYPES:
+        sub = df[df["segment_type"] == segment_type]
+        if len(sub) == 0:
             continue
-        print(f"{col}: mean={vals.mean():.4f}, median={vals.median():.4f}")
+        print(f"\n--- {segment_type} ({len(sub)} segments) ---")
+
+        method_pct = sub["method_chosen"].value_counts(normalize=True) * 100
+        print("Method chosen split:")
+        for m, p in method_pct.items():
+            print(f"  {m}: {p:.1f}%")
+
+        for col in ["corr_zcr", "corr_kurt", "energy_ratio_murmur",
+                    "kurtosis_before", "kurtosis_after", "spectral_centroid_murmur",
+                    "selected_component_energy_center_frac"]:
+            vals = sub[col].dropna()
+            if len(vals) == 0:
+                continue
+            print(f"{col}: mean={vals.mean():.4f}, median={vals.median():.4f}")
 
 
 def main():
@@ -359,7 +413,8 @@ def main():
     plot_correlation_histograms(df)
     plot_energy_ratio_histogram(df)
     plot_component_energy_center_histogram(df)
-    plot_pitch_vs_centroid(df)
+    for segment_type in SEGMENT_TYPES:
+        plot_pitch_vs_centroid(df, segment_type)
 
     print_summary(df)
 

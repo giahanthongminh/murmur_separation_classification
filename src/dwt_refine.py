@@ -23,7 +23,13 @@ def dwt_refine(signal, wavelet="db4", level=4):
     new_coeffs = [coeffs[0]]  # keep approximation
 
     for c in coeffs[1:]:
-        new_coeffs.append(pywt.threshold(c, threshold, mode="soft"))
+        if not np.any(c):
+            # All-zero band (e.g. CSSA selected zero "normal" components):
+            # nothing to threshold, and pywt's soft-threshold formula divides
+            # by the coefficient magnitude, which is 0 here.
+            new_coeffs.append(c)
+        else:
+            new_coeffs.append(pywt.threshold(c, threshold, mode="soft"))
 
     # Reconstruct signal
     refined = pywt.waverec(new_coeffs, wavelet)
