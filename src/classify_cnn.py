@@ -12,10 +12,10 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 from sklearn.preprocessing import LabelEncoder
-from pathlib import Path
+from config import FEATURE_OUTPUT_DIR
+from src.data_validation import validate_dataset
 
-DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-spectrogram_dir = DATA_ROOT / "spectrograms"
+spectrogram_dir = FEATURE_OUTPUT_DIR / "spectrograms"
 
 # Use MPS (Apple Silicon GPU) if available, else CPU
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -133,7 +133,8 @@ def evaluate_cnn(df, n_splits=10, epochs=30):
     print(confusion_matrix(all_y_test, all_y_pred))
 
 
-df = pd.read_csv(DATA_ROOT / "labels_cnn.csv")
+validate_dataset()
+df = pd.read_csv(FEATURE_OUTPUT_DIR / "labels_cnn.csv")
 
 print("\n" + "="*50)
 print("CNN — Separated Murmur (Mel Spectrogram)")

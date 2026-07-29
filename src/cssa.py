@@ -1,167 +1,118 @@
-'''
-CSSA-ZCR
-CSSA-kurtosis (GA-optimized joint selection)
-Compare methods (correlation)
-Outputs:
-- normal sound
-- murmur
+"""Compatibility API for the auditable CSSA implementation.
 
-Implements the CSSA stage of Qi & Sanei, "Murmur Separation and Classification
-from Heart Sound Using Constrained Singular Spectrum Analysis and Wavelet
-Transform," APSIPA ASC 2024.
-'''
+New experiments should use :mod:`src.separation.core` and call the output a
+``murmur_candidate`` until benchmark evidence supports a stronger claim.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
 
 import numpy as np
-from ssa import ssa_decompose
+
+from config import DEFAULT_SEPARATION_CONFIG, SeparationConfig
+from src.separation.core import (
+    compare_separation_methods,
+    kurtosis_score,
+    separate_signal,
+    zero_crossing_rate,
+)
+from src.separation.metrics import safe_correlation
 
 
-def zero_crossing_rate(signal):
-    """Count how often the signal changes sign."""
-    if len(signal) < 2:
-        return 0.0
-
-    signs = np.sign(signal)
-    return np.mean(np.diff(signs) != 0)
-
-
-def cssa_zcr(signal, L, zcr_threshold=0.05):
-    """
-    Reconstruct normal heart sound using low-ZCR components.
-    Murmur is the residual.
-    """
-    components = ssa_decompose(signal, L)
-
-    selected = []
-    zcr_values = []
-
-    for i, comp in enumerate(components):
-        zcr = zero_crossing_rate(comp)
-        zcr_values.append(zcr)
-
-        if zcr <= zcr_threshold:
-            selected.append(i)
-
-    if len(selected) == 0:
-        normal_reconstructed = np.zeros_like(signal)
-    else:
-        normal_reconstructed = np.sum(components[selected], axis=0)
-
-    murmur = signal - normal_reconstructed
-
-    return normal_reconstructed, murmur, selected, zcr_values
-
-def kurtosis_score(signal):
-    """Measure how peaky the signal distribution is."""
-    signal = np.asarray(signal)
-    signal = signal - np.mean(signal)
-
-    std = np.std(signal)
-    if std == 0:
-        return 0.0
-
-    z = signal / std
-    return np.mean(z ** 4) - 3
+def _legacy_config(
+    L: int,
+    *,
+    zcr_threshold: float | None = None,
+    pop_size: int | None = None,
+    n_generations: int | None = None,
+    mutation_rate: float | None = None,
+    random_state: int | None = None,
+) -> SeparationConfig:
+    updates: dict[str, object] = {"ssa_window_length": L}
+    if zcr_threshold is not None:
+        updates.update(
+            {"zcr_threshold_strategy": "fixed", "zcr_threshold": zcr_threshold}
+        )
+    if pop_size is not None:
+        updates["kurtosis_population_size"] = pop_size
+    if n_generations is not None:
+        updates["kurtosis_generations"] = n_generations
+    if mutation_rate is not None:
+        updates["kurtosis_mutation_rate"] = mutation_rate
+    if random_state is not None:
+        updates["random_seed"] = random_state
+    return replace(DEFAULT_SEPARATION_CONFIG, **updates)
 
 
-def cssa_kurtosis(signal, L, pop_size=30, n_generations=40,
-                   mutation_rate=0.05, random_state=42):
-    """
-    Reconstruct normal heart sound by selecting the subset of SSA components
-    W in {0,1}^d that maximizes kurtosis(R @ W).
-
-    This is a nonlinear integer programming problem (the objective depends on
-    the *combined* reconstructed signal, not on each component independently),
-    so it's solved with a Genetic Algorithm rather than ranking components by
-    their individual kurtosis.
-    Murmur is the residual.
-    """
-    components = ssa_decompose(signal, L)
-    d = components.shape[0]
-    rng = np.random.default_rng(random_state)
-
-    kurt_values = [kurtosis_score(comp) for comp in components]
-
-    def fitness(w):
-        if not w.any():
-            return -np.inf
-        return kurtosis_score(w @ components)
-
-    population = rng.integers(0, 2, size=(pop_size, d)).astype(np.int8)
-    best_w, best_fit = None, -np.inf
-
-    for _ in range(n_generations):
-        fitness_vals = np.array([fitness(w) for w in population])
-
-        gen_best_idx = np.argmax(fitness_vals)
-        if fitness_vals[gen_best_idx] > best_fit:
-            best_fit = fitness_vals[gen_best_idx]
-            best_w = population[gen_best_idx].copy()
-
-        # Elitism + tournament selection + uniform crossover + mutation
-        next_population = [best_w.copy()]
-        while len(next_population) < pop_size:
-            i, j = rng.integers(0, pop_size, size=2)
-            parent1 = population[i] if fitness_vals[i] > fitness_vals[j] else population[j]
-            i, j = rng.integers(0, pop_size, size=2)
-            parent2 = population[i] if fitness_vals[i] > fitness_vals[j] else population[j]
-
-            mask = rng.integers(0, 2, size=d).astype(bool)
-            child = np.where(mask, parent1, parent2)
-
-            flip = rng.random(d) < mutation_rate
-            child = np.where(flip, 1 - child, child).astype(np.int8)
-
-            next_population.append(child)
-
-        population = np.array(next_population[:pop_size])
-
-    if best_w is None or not best_w.any():
-        normal_reconstructed = np.zeros_like(signal)
-        selected = np.array([], dtype=int)
-    else:
-        normal_reconstructed = best_w @ components
-        selected = np.flatnonzero(best_w)
-
-    murmur = signal - normal_reconstructed
-
-    return normal_reconstructed, murmur, selected, kurt_values
-
-def correlation_score(x, y):
-    """Measure overlap between reconstructed normal sound and murmur."""
-    x = np.asarray(x)
-    y = np.asarray(y)
-
-    if np.std(x) == 0 or np.std(y) == 0:
-        return 0.0
-
-    return np.corrcoef(x, y)[0, 1]
-
-
-def compare_cssa_methods(signal, L, zcr_threshold=0.05):
-    """Run both CSSA methods and keep the one with lower correlation."""
-    normal_zcr, murmur_zcr, selected_zcr, zcr_values = cssa_zcr(
-        signal, L, zcr_threshold=zcr_threshold
+def cssa_zcr(signal: np.ndarray, L: int, zcr_threshold: float | None = None):
+    config = _legacy_config(L, zcr_threshold=zcr_threshold)
+    result = separate_signal(signal, config=config, method="zcr")
+    selected = result.assignments["normal"]
+    zcr_values = [row["zcr"] for row in result.component_features]
+    return (
+        result.normal_estimate,
+        result.murmur_candidate + result.noise_candidate,
+        selected,
+        zcr_values,
     )
-    normal_kurt, murmur_kurt, selected_kurt, kurt_values = cssa_kurtosis(signal, L)
 
-    corr_zcr = correlation_score(normal_zcr, murmur_zcr)
-    corr_kurt = correlation_score(normal_kurt, murmur_kurt)
 
-    if abs(corr_zcr) <= abs(corr_kurt):
-        best_method = "zcr"
-        best_normal = normal_zcr
-        best_murmur = murmur_zcr
-    else:
-        best_method = "kurtosis"
-        best_normal = normal_kurt
-        best_murmur = murmur_kurt
+def cssa_kurtosis(
+    signal: np.ndarray,
+    L: int,
+    pop_size: int = 30,
+    n_generations: int = 40,
+    mutation_rate: float = 0.05,
+    random_state: int = 42,
+):
+    config = _legacy_config(
+        L,
+        pop_size=pop_size,
+        n_generations=n_generations,
+        mutation_rate=mutation_rate,
+        random_state=random_state,
+    )
+    result = separate_signal(signal, config=config, method="kurtosis")
+    selected = np.asarray(result.assignments["normal"], dtype=int)
+    kurtosis_values = [row["kurtosis"] for row in result.component_features]
+    return (
+        result.normal_estimate,
+        result.murmur_candidate + result.noise_candidate,
+        selected,
+        kurtosis_values,
+    )
 
+
+def correlation_score(left: np.ndarray, right: np.ndarray) -> float:
+    """Backward-compatible diagnostic; no longer the sole selector."""
+
+    return safe_correlation(left, right)
+
+
+def compare_cssa_methods(
+    signal: np.ndarray,
+    L: int,
+    zcr_threshold: float | None = None,
+    **_: object,
+) -> dict[str, object]:
+    """Backward-compatible comparison backed by multi-metric selection."""
+
+    config = _legacy_config(L, zcr_threshold=zcr_threshold)
+    best, candidates = compare_separation_methods(signal, config=config)
+    zcr = candidates["zcr"]
+    kurtosis = candidates["kurtosis"]
     return {
-        "best_method": best_method,
-        "best_normal": best_normal,
-        "best_murmur": best_murmur,
-        "corr_zcr": corr_zcr,
-        "corr_kurt": corr_kurt,
-        "selected_zcr": selected_zcr,
-        "selected_kurt": selected_kurt,
+        "best_method": best.selected_method,
+        "best_normal": best.normal_estimate,
+        "best_murmur": best.murmur_candidate + best.noise_candidate,
+        "best_murmur_candidate": best.murmur_candidate,
+        "best_noise_candidate": best.noise_candidate,
+        "metrics": best.metrics,
+        "corr_zcr": zcr.metrics["normal_residual_correlation"],
+        "corr_kurt": kurtosis.metrics["normal_residual_correlation"],
+        "score_zcr": zcr.metrics["selection_score"],
+        "score_kurt": kurtosis.metrics["selection_score"],
+        "selected_zcr": zcr.assignments["normal"],
+        "selected_kurt": kurtosis.assignments["normal"],
     }

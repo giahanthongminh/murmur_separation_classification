@@ -1,51 +1,63 @@
-# extract_features_cnn.py
-# Extract Mel Spectrogram from separated murmur WAV files
-# Saves as numpy arrays for CNN input
+"""Create 64x64 mel features from project-owned murmur candidates."""
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import librosa
-from pathlib import Path
 
-DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-labels_path  = DATA_ROOT / "labels.csv"
-output_dir   = DATA_ROOT / "output"
-spectrogram_dir = DATA_ROOT / "spectrograms"
-spectrogram_dir.mkdir(exist_ok=True)
+from config import FEATURE_OUTPUT_DIR, LABELS_PATH, SEPARATION_OUTPUT_DIR
+from src.data_validation import validate_dataset
 
-labels = pd.read_csv(labels_path)
-rows = []
 
-for _, row in labels.iterrows():
-    patient_id = row["Patient ID"]
-    label = row["Systolic murmur timing"]
-
-    for location in ["AV", "PV", "TV", "MV"]:
-        wav_path = output_dir / f"{patient_id}_{location}" / "murmur_separated.wav"
-        if not wav_path.exists():
+def main() -> int:
+    validate_dataset()
+    spectrogram_dir = FEATURE_OUTPUT_DIR / "spectrograms"
+    spectrogram_dir.mkdir(parents=True, exist_ok=True)
+    labels = pd.read_csv(LABELS_PATH, dtype={"Patient ID": str})
+    label_map = dict(
+        zip(labels["Patient ID"], labels["Systolic murmur timing"], strict=True)
+    )
+    rows = []
+    for recording_dir in sorted(SEPARATION_OUTPUT_DIR.iterdir()):
+        if not recording_dir.is_dir() or "_" not in recording_dir.name:
             continue
+        patient_id, location = recording_dir.name.rsplit("_", 1)
+        if patient_id not in label_map:
+            continue
+        candidates = sorted(recording_dir.glob("seg_*_murmur_candidate.npy"))
+        for path in candidates:
+            segment_index = path.stem.split("_")[1]
+            signal = np.load(path).astype(float)
+            if len(signal) < 16:
+                continue
+            n_fft = min(512, len(signal))
+            n_fft -= n_fft % 2
+            mel = librosa.feature.melspectrogram(
+                y=signal, sr=4000, n_mels=64, n_fft=max(2, n_fft)
+            )
+            mel_db = librosa.power_to_db(mel, ref=np.max)
+            target = 64
+            if mel_db.shape[1] >= target:
+                mel_db = mel_db[:, :target]
+            else:
+                mel_db = np.pad(
+                    mel_db, ((0, 0), (0, target - mel_db.shape[1])), mode="constant"
+                )
+            key = f"{recording_dir.name}_seg_{segment_index}"
+            np.save(spectrogram_dir / f"{key}.npy", mel_db.astype(np.float32))
+            rows.append(
+                {
+                    "key": key,
+                    "patient_id": patient_id,
+                    "location": location,
+                    "segment_index": int(segment_index),
+                    "label": label_map[patient_id],
+                }
+            )
+    frame = pd.DataFrame(rows)
+    frame.to_csv(FEATURE_OUTPUT_DIR / "labels_cnn.csv", index=False)
+    print(f"Total spectrograms: {len(frame)}")
+    return 0
 
-        signal, sr = librosa.load(wav_path, sr=4000)
 
-        # Mel spectrogram — 64 mel bands, fixed size 64×64
-        mel = librosa.feature.melspectrogram(y=signal, sr=sr, n_mels=64, n_fft=512)
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-
-        # Resize to fixed 64×64 by cropping or padding time axis
-        target_len = 64
-        if mel_db.shape[1] >= target_len:
-            mel_db = mel_db[:, :target_len]
-        else:
-            pad = target_len - mel_db.shape[1]
-            mel_db = np.pad(mel_db, ((0, 0), (0, pad)), mode="constant")
-
-        # Save spectrogram as .npy
-        key = f"{patient_id}_{location}"
-        np.save(spectrogram_dir / f"{key}.npy", mel_db)
-
-        rows.append({"key": key, "patient_id": patient_id, "label": label})
-
-df = pd.DataFrame(rows)
-df.to_csv(DATA_ROOT / "labels_cnn.csv", index=False)
-print(f"Total spectrograms: {len(df)}")
-print(df["label"].value_counts())
+if __name__ == "__main__":
+    raise SystemExit(main())

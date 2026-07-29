@@ -1,9 +1,11 @@
-from pathlib import Path
 import librosa
 import matplotlib.pyplot as plt
-from ssa import ssa_decompose
+from src.ssa import ssa_decompose
+from config import AUDIO_DIR
+from src.data_validation import validate_dataset
 
-wav_dir = Path("/Users/danggiahan/Documents/heart_sounds/wav")
+wav_dir = AUDIO_DIR
+validate_dataset()
 file = list(wav_dir.glob("*.wav"))[0]
 
 print("Loading file...")

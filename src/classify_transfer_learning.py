@@ -22,13 +22,13 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import (accuracy_score, f1_score,
                              classification_report, confusion_matrix)
 from sklearn.preprocessing import LabelEncoder
-from pathlib import Path
+from config import FEATURE_OUTPUT_DIR
+from src.data_validation import validate_dataset
 
-DATA_ROOT    = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-spec_dir     = DATA_ROOT / "spectrograms_dl"          # separated murmur
-spec_dir_ori = DATA_ROOT / "spectrograms_original"    # original WAV
-csv_path     = DATA_ROOT / "labels_dl.csv"
-csv_path_ori = DATA_ROOT / "labels_original.csv"
+spec_dir = FEATURE_OUTPUT_DIR / "spectrograms_dl"          # murmur candidate
+spec_dir_ori = FEATURE_OUTPUT_DIR / "spectrograms_original" # original WAV
+csv_path = FEATURE_OUTPUT_DIR / "labels_dl.csv"
+csv_path_ori = FEATURE_OUTPUT_DIR / "labels_original.csv"
 
 BATCH     = 32
 EPOCHS_FROZEN   = 5    # train only FC while backbone frozen
@@ -174,6 +174,7 @@ def evaluate(df, data_dir):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    validate_dataset()
     # --- Baseline: Original WAV (no separation) ---
     if csv_path_ori.exists():
         df_ori = pd.read_csv(csv_path_ori)

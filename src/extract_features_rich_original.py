@@ -4,14 +4,15 @@
 import pandas as pd
 import numpy as np
 import librosa
-from pathlib import Path
 from scipy.stats import skew, kurtosis
 
-DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-labels_path   = DATA_ROOT / "labels.csv"
-wav_dir       = DATA_ROOT / "training_data"
-tsv_dir       = DATA_ROOT / "training_data"
-features_path = DATA_ROOT / "features_rich_original.csv"
+from config import AUDIO_DIR, FEATURE_OUTPUT_DIR, LABELS_PATH
+from src.data_validation import validate_dataset
+
+labels_path = LABELS_PATH
+wav_dir = AUDIO_DIR
+tsv_dir = AUDIO_DIR
+features_path = FEATURE_OUTPUT_DIR / "features_rich_original.csv"
 
 N_ENERGY_SEGMENTS = 10
 
@@ -76,6 +77,7 @@ def extract_features(signal, sr):
     return features
 
 
+validate_dataset()
 labels = pd.read_csv(labels_path)
 rows = []
 

@@ -1,0 +1,51 @@
+# CirCor murmur isolation
+
+This repository tests whether normal-heart suppression can preserve murmur-related temporal and spectral structure. The residual is called a **murmur candidate** until synthetic ground truth and real-data proxy metrics support a stronger claim.
+
+## Pipeline boundary
+
+- Input is restricted to `~/physionet.org/files/circor-heart-sound/1.0.1/training_data/*.wav`.
+- Patient metadata comes from `training_data.csv`.
+- Generated arrays, audio, figures, configurations, and reports are written only under this repository's ignored `outputs/` directory.
+- Set `CIRCOR_DATASET_ROOT` to override the dataset location.
+
+## Setup and validation
+
+```bash
+./setup.sh
+python -m src.data_validation
+pytest -q
+```
+
+Validation checks the 3,163 recordings, 942 patients, filename pairing, readable/non-empty WAVs, sampling rates, TSV states and bounds, duplicate IDs/paths, and metadata recording references. It always writes `outputs/reports/dataset_validation.json`; strict mode exits nonzero when any anomaly is present.
+
+On the audited local snapshot, counts are correct but strict validation intentionally fails: `50782_MV_1.wav` has no exact TSV pair, `50782_MV.tsv` is orphaned and malformed, and five other TSVs contain interval overlap/order errors beyond the allowed 1 ms rounding tolerance. Resolve or explicitly exclude these records before a full experiment. `--skip-dataset-validation` exists only for targeted diagnostic work on already-inspected valid records.
+
+## Real-data audit
+
+```bash
+python -m src.separation.audit --limit 20
+```
+
+Each selected systolic cycle is processed separately and receives:
+
+- `original`, `normal_estimate`, `murmur_candidate`, and `noise_candidate` as NPY and WAV;
+- `component_features.csv` and `selected_components.json`;
+- `metrics.json` and `diagnostic_plot.png`.
+
+The summary is `outputs/reports/separation_summary.csv`. Use `--energy-threshold` to compare 0.95, 0.975, 0.99, and 0.995. DWT is an opt-in ablation via `--use-dwt`, not an assumed improvement.
+
+## Synthetic ground truth
+
+```bash
+python -m src.evaluation.synthetic_benchmark
+# Fast smoke run:
+python -m src.evaluation.synthetic_benchmark --quick
+```
+
+The benchmark covers eight murmur timing/shapes and sweeps mixture ratios, SNRs, and seeds. It reports SI-SDR, SDR, SNR improvement, correlations, spectral/envelope error, onset/offset error, and cross-source leakage to `outputs/reports/synthetic_benchmark.csv`.
+Ground-truth mixtures and per-method estimated stems/metrics are retained under `outputs/synthetic/` for direct inspection.
+
+## Research order
+
+Do not tune the classifiers until separation achieves low reconstruction and S1/S2 leakage, strong murmur-region preservation, stable negative controls, plausible timing, and credible synthetic source metrics. See `docs/separation_pipeline_audit.md` for the baseline audit and affected functions.

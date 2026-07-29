@@ -1,2 +1,16 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
+.DS_Store
+
+# Generated research artifacts stay outside the dataset and out of Git.
+outputs/
+*.npy
+*.npz
+*.pkl
+*.joblib
+*.wav
+
+# Small synthetic/test fixtures may be committed intentionally.
+!tests/fixtures/**/*.wav

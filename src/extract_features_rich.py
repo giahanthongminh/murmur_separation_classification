@@ -10,13 +10,14 @@ import json
 import pandas as pd
 import numpy as np
 import librosa
-from pathlib import Path
 from scipy.stats import skew, kurtosis
 
-DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-labels_path   = DATA_ROOT / "labels.csv"
-output_dir    = DATA_ROOT / "output_per_seg"
-features_path = DATA_ROOT / "features_rich.csv"
+from config import FEATURE_OUTPUT_DIR, LABELS_PATH, SEPARATION_OUTPUT_DIR
+from src.data_validation import validate_dataset
+
+labels_path = LABELS_PATH
+output_dir = SEPARATION_OUTPUT_DIR
+features_path = FEATURE_OUTPUT_DIR / "features_rich.csv"
 
 SR = 4000
 N_ENERGY_SEGMENTS = 10  # split systole into 10 segments → RMS per segment
@@ -108,14 +109,18 @@ def load_systole_signal(patient_id, location):
         meta = json.load(f)
 
     segments = []
-    for entry in sorted(meta, key=lambda m: m["seg_idx"]):
-        seg_path = folder / f"seg_{entry['seg_idx']}_murmur.npy"
+    for entry in sorted(meta, key=lambda m: m.get("cycle_index", m.get("seg_idx", 0))):
+        segment_index = entry.get("cycle_index", entry.get("seg_idx", 0))
+        seg_path = folder / f"seg_{segment_index}_murmur_candidate.npy"
+        if not seg_path.exists():
+            seg_path = folder / f"seg_{segment_index}_murmur.npy"
         if seg_path.exists():
             segments.append(np.load(seg_path))
 
     return np.concatenate(segments) if segments else None
 
 
+validate_dataset()
 labels = pd.read_csv(labels_path)
 rows = []
 

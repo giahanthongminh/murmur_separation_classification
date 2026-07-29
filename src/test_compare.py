@@ -1,15 +1,17 @@
-from pathlib import Path
 import librosa
 import matplotlib.pyplot as plt
-from cssa import compare_cssa_methods
+from src.cssa import compare_cssa_methods
+from config import AUDIO_DIR
+from src.data_validation import validate_dataset
 
-wav_dir = Path("/Users/danggiahan/Documents/heart_sounds/wav")
+wav_dir = AUDIO_DIR
+validate_dataset()
 file = list(wav_dir.glob("*.wav"))[0]
 
 signal, sr = librosa.load(file, sr=4000)
 signal = signal[:4000]
 
-result = compare_cssa_methods(signal, L=100, zcr_threshold=0.05)
+result = compare_cssa_methods(signal, L=100)
 
 print("Best method:", result["best_method"])
 print("corr_zcr:", result["corr_zcr"])
@@ -27,7 +29,7 @@ plt.title(f"Best Normal ({result['best_method']})")
 
 plt.subplot(3, 1, 3)
 plt.plot(result["best_murmur"])
-plt.title(f"Best Murmur ({result['best_method']})")
+plt.title(f"Best Murmur Candidate ({result['best_method']})")
 
 plt.tight_layout()
 plt.show()

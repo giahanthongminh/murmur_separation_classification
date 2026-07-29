@@ -10,17 +10,18 @@
 import numpy as np
 import librosa
 import pandas as pd
-from pathlib import Path
 from PIL import Image
 
-DATA_ROOT   = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-wav_dir     = DATA_ROOT / "training_data"
-tsv_dir     = DATA_ROOT / "training_data"
-spec_dir    = DATA_ROOT / "spectrograms_original"
-labels_path = DATA_ROOT / "labels.csv"
-output_csv  = DATA_ROOT / "labels_original.csv"
+from config import AUDIO_DIR, FEATURE_OUTPUT_DIR, LABELS_PATH
+from src.data_validation import validate_dataset
 
-spec_dir.mkdir(exist_ok=True)
+wav_dir = AUDIO_DIR
+tsv_dir = AUDIO_DIR
+spec_dir = FEATURE_OUTPUT_DIR / "spectrograms_original"
+labels_path = LABELS_PATH
+output_csv = FEATURE_OUTPUT_DIR / "labels_original.csv"
+
+spec_dir.mkdir(parents=True, exist_ok=True)
 
 SR     = 4000
 N_MELS = 128
@@ -59,6 +60,7 @@ def imagenet_normalize(arr3):
     return (arr3 - mean) / std
 
 
+validate_dataset()
 labels_df = pd.read_csv(labels_path)
 label_map = dict(zip(labels_df["Patient ID"].astype(str),
                      labels_df["Systolic murmur timing"]))
