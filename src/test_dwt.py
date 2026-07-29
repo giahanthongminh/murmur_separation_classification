@@ -1,10 +1,12 @@
-from pathlib import Path
 import librosa
 import matplotlib.pyplot as plt
-from cssa import compare_cssa_methods
-from dwt_refine import dwt_refine
+from src.cssa import compare_cssa_methods
+from src.dwt_refine import dwt_refine
+from config import AUDIO_DIR
+from src.data_validation import validate_dataset
 
-wav_dir = Path("/Users/danggiahan/Documents/heart_sounds/wav")
+wav_dir = AUDIO_DIR
+validate_dataset()
 file = list(wav_dir.glob("*.wav"))[0]
 
 signal, sr = librosa.load(file, sr=4000)
@@ -19,7 +21,7 @@ normal = result["best_normal"]
 refined_normal = dwt_refine(normal)
 
 # Step 3: final murmur
-final_murmur = signal - refined_normal
+murmur_candidate = signal - refined_normal
 
 print("Best method:", result["best_method"])
 
@@ -38,8 +40,8 @@ plt.plot(refined_normal)
 plt.title("Normal (after DWT)")
 
 plt.subplot(4, 1, 4)
-plt.plot(final_murmur)
-plt.title("Final Murmur")
+plt.plot(murmur_candidate)
+plt.title("Murmur Candidate")
 
 plt.tight_layout()
 plt.show()

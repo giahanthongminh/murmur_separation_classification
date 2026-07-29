@@ -11,7 +11,8 @@ from sklearn.metrics import (accuracy_score, f1_score,
                              classification_report, confusion_matrix)
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from pathlib import Path
+from config import FEATURE_OUTPUT_DIR
+from src.data_validation import validate_dataset
 
 try:
     from imblearn.over_sampling import SMOTE
@@ -19,9 +20,6 @@ try:
 except ImportError:
     HAS_SMOTE = False
     print("imbalanced-learn not installed — running without SMOTE")
-
-DATA_ROOT = Path.home() / "physionet.org/files/circor-heart-sound/1.0.1"
-
 
 def load(path):
     df = pd.read_csv(path)
@@ -109,8 +107,9 @@ def evaluate(name, X, y, groups, n_splits=10):
     print(confusion_matrix(all_y_test, all_y_pred))
 
 
-X_sep,  y_sep,  g_sep  = load(DATA_ROOT / "features_rich.csv")
-X_orig, y_orig, g_orig = load(DATA_ROOT / "features_rich_original.csv")
+validate_dataset()
+X_sep,  y_sep,  g_sep  = load(FEATURE_OUTPUT_DIR / "features_rich.csv")
+X_orig, y_orig, g_orig = load(FEATURE_OUTPUT_DIR / "features_rich_original.csv")
 
 for model_name in ["SVM", "Random Forest"]:
     print(f"\n{'='*50}\n{model_name}\n{'='*50}")

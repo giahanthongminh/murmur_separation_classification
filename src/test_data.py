@@ -1,8 +1,10 @@
-from pathlib import Path
 import librosa
 import matplotlib.pyplot as plt
+from config import AUDIO_DIR
+from src.data_validation import validate_dataset
 
-wav_dir = Path("/Users/danggiahan/Documents/heart_sounds/wav")
+wav_dir = AUDIO_DIR
+validate_dataset()
 files = list(wav_dir.glob("*.wav"))
 
 print("Found:", len(files))
