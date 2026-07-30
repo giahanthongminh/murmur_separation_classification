@@ -73,12 +73,16 @@ a different method, output profile, scope, or separation configuration.
 The audit exports `murmur_observations_<run>.csv` only from location-aware
 `Present` recordings whose candidates pass the quality gate. It includes
 normalized and absolute onset/offset, amplitude envelope and RMS statistics,
-dominant frequency and spectral shape, PSD band-energy ratios, and
-time-frequency peak/entropy/flux. The grouped means and medians are written to
-`murmur_observation_summary_<run>.csv`. These describe an estimated murmur
+rule-based envelope shape (constant, crescendo, decrescendo, central peak, or
+multi-peak), rise/decay and burst measurements, dominant frequency and spectral
+shape, PSD peak count/width/concentration, and the dominant-frequency
+trajectory through time. The grouped numeric means and medians are written to
+`murmur_observation_summary_<run>.csv`; morphology-category counts and ratios
+are written to `murmur_morphology_summary_<run>.csv`. These describe an estimated murmur
 candidate, not clean-source ground truth. Amplitude is relative to each WAV's
 digital full scale and should not be interpreted as calibrated sound pressure
-or compared clinically across recording devices.
+or compared clinically across recording devices. The morphology labels are
+reproducible descriptive rules, not diagnoses or classifier ground truth.
 
 Phase-aware candidates are tuned by the full-cycle synthetic ground-truth grid
 rather than the real audit set. Run

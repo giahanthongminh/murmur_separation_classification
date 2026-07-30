@@ -19,6 +19,7 @@ from src.separation.audit import (
     build_cardiac_cycle_context,
     classify_audit_outcome,
     summarize_audit_quality,
+    summarize_murmur_morphology_categories,
     summarize_murmur_observations,
 )
 from src.separation.metrics import (
@@ -273,6 +274,76 @@ def test_murmur_observation_features_capture_tone_and_amplitude() -> None:
     assert features["time_frequency_frequency_resolution_hz"] > 0
     assert np.isfinite(features["time_frequency_entropy"])
     assert np.isfinite(features["time_frequency_spectral_flux"])
+    assert features["envelope_shape"] == "constant"
+    assert features["psd_morphology"] == "narrow_single_peak"
+    assert features["time_frequency_ridge_direction"] == "stable"
+
+
+@pytest.mark.parametrize(
+    ("envelope_name", "amplitude"),
+    [
+        ("crescendo", lambda position: 0.05 + 0.45 * position),
+        ("decrescendo", lambda position: 0.50 - 0.45 * position),
+        (
+            "crescendo_decrescendo",
+            lambda position: 0.05 + 0.45 * np.sin(np.pi * position),
+        ),
+    ],
+)
+def test_murmur_morphology_characterizes_envelope_shape(
+    envelope_name: str, amplitude: object
+) -> None:
+    sample_rate = 4000
+    time = np.arange(int(0.3 * sample_rate)) / sample_rate
+    position = time / time[-1]
+    signal = amplitude(position) * np.sin(2 * np.pi * 180 * time)  # type: ignore[operator]
+    features = murmur_observation_features(signal, sample_rate)
+    assert features["envelope_shape"] == envelope_name
+    assert 0 <= features["envelope_time_to_peak_ratio"] <= 1
+    assert features["envelope_area_normalized"] > 0
+
+
+def test_murmur_morphology_detects_two_psd_peaks() -> None:
+    sample_rate = 4000
+    time = np.arange(int(0.4 * sample_rate)) / sample_rate
+    signal = 0.4 * np.sin(2 * np.pi * 180 * time)
+    signal += 0.32 * np.sin(2 * np.pi * 420 * time)
+    features = murmur_observation_features(signal, sample_rate)
+    assert features["psd_morphology"] == "double_peak"
+    assert features["psd_prominent_peak_count"] == 2
+    frequencies = sorted(
+        [
+            features["psd_primary_peak_frequency_hz"],
+            features["psd_secondary_peak_frequency_hz"],
+        ]
+    )
+    assert frequencies[0] == pytest.approx(180, abs=10)
+    assert frequencies[1] == pytest.approx(420, abs=10)
+
+
+def test_murmur_morphology_detects_rising_frequency_trajectory() -> None:
+    sample_rate = 4000
+    time = np.arange(int(0.4 * sample_rate)) / sample_rate
+    phase = 2 * np.pi * (100 * time + 0.5 * 1000 * time**2)
+    features = murmur_observation_features(0.4 * np.sin(phase), sample_rate)
+    assert features["time_frequency_ridge_direction"] == "rising"
+    assert features["time_frequency_ridge_slope_hz_per_second"] > 500
+    assert features["time_frequency_ridge_end_hz"] > features[
+        "time_frequency_ridge_start_hz"
+    ]
+
+
+def test_murmur_morphology_counts_separated_active_bursts() -> None:
+    sample_rate = 4000
+    time = np.arange(int(0.4 * sample_rate)) / sample_rate
+    amplitude = 0.4 * np.exp(-0.5 * ((time - 0.10) / 0.018) ** 2)
+    amplitude += 0.35 * np.exp(-0.5 * ((time - 0.29) / 0.020) ** 2)
+    features = murmur_observation_features(
+        amplitude * np.sin(2 * np.pi * 180 * time), sample_rate
+    )
+    assert features["envelope_shape"] == "multi_peak"
+    assert features["active_burst_count"] == 2
+    assert 0 < features["active_time_ratio"] < 0.5
 
 
 def test_full_cycle_proxy_metrics_compute_phase_leakage() -> None:
@@ -496,3 +567,31 @@ def test_observation_summary_only_uses_accepted_present_candidates() -> None:
     assert observation.loc[0, "segment_count"] == 1
     assert observation.loc[0, "amplitude_rms_mean"] == pytest.approx(0.2)
     assert observation.loc[0, "psd_peak_frequency_hz_mean"] == pytest.approx(180)
+
+
+def test_morphology_summary_counts_only_accepted_present_candidates() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "murmur_label": "Present",
+                "candidate_quality_status": "accepted",
+                "timing_label": "Early-systolic",
+                "envelope_shape": "crescendo",
+                "psd_morphology": "double_peak",
+                "time_frequency_ridge_direction": "rising",
+            },
+            {
+                "murmur_label": "Present",
+                "candidate_quality_status": "fallback",
+                "timing_label": "Early-systolic",
+                "envelope_shape": "constant",
+                "psd_morphology": "multi_peak",
+                "time_frequency_ridge_direction": "stable",
+            },
+        ]
+    )
+    morphology = summarize_murmur_morphology_categories(frame)
+    assert len(morphology) == 3
+    assert set(morphology["category"]) == {"crescendo", "double_peak", "rising"}
+    assert morphology["segment_count"].eq(1).all()
+    assert morphology["ratio"].eq(1.0).all()
