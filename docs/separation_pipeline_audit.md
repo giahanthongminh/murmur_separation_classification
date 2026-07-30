@@ -84,6 +84,10 @@ Legacy classifier experiments are retained. Their paths are redirected to projec
 
 The repaired real-data audit processes each contiguous S1-systole-S2-diastole cycle without concatenating disjoint intervals. Timing is detected and normalized only within the systolic mask. `s1_leakage_ratio` and `s2_leakage_ratio` measure candidate energy in each heart-sound phase relative to original phase energy, while `outside_murmur_energy_ratio` measures the fraction of total candidate energy outside the annotated systole. This supplies full-cycle leakage context while retaining cycle identity.
 
+Adjacent phase boundaries that differ by no more than the dataset validator's
+1 ms annotation tolerance are normalized to one shared sample boundary. Larger
+gaps or overlaps remain invalid and are skipped rather than silently repaired.
+
 Phase-aware component selection now augments ZCR or kurtosis assignment with
 per-phase energy density. A provisional murmur component must meet configured
 systolic-focus and systole-to-S1/S2 thresholds. Rejected components are assigned

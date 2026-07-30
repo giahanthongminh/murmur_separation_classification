@@ -252,3 +252,37 @@ def test_cycle_context_contains_all_four_phases() -> None:
         "diastole": (300, 500),
     }
     assert all(mask.any() for mask in context.phase_masks.values())
+
+
+def test_cycle_context_normalizes_submillisecond_boundary_overlap() -> None:
+    sample_rate = 4000
+    signal = np.arange(2400, dtype=float)
+    annotations = pd.DataFrame(
+        [
+            (0.0, 0.1, 1),
+            (0.1, 0.2, 2),
+            (0.2, 0.4, 3),
+            (0.3996, 0.6, 4),
+        ],
+        columns=["start", "end", "state"],
+    )
+    context = build_cardiac_cycle_context(signal, annotations, 1, sample_rate)
+    assert context.phase_bounds["s2"][1] == context.phase_bounds["diastole"][0]
+    coverage = np.sum(np.stack(list(context.phase_masks.values())), axis=0)
+    assert np.all(coverage == 1)
+
+
+def test_cycle_context_rejects_boundary_overlap_beyond_tolerance() -> None:
+    sample_rate = 4000
+    signal = np.arange(2400, dtype=float)
+    annotations = pd.DataFrame(
+        [
+            (0.0, 0.1, 1),
+            (0.1, 0.2, 2),
+            (0.2, 0.4, 3),
+            (0.398, 0.6, 4),
+        ],
+        columns=["start", "end", "state"],
+    )
+    with pytest.raises(ValueError, match="exceeding .* tolerance"):
+        build_cardiac_cycle_context(signal, annotations, 1, sample_rate)
