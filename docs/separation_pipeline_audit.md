@@ -129,3 +129,36 @@ is `0.1766`. These results do not pass separation acceptance. The reporting
 and tuning infrastructure is usable, but the current CSSA component-selection
 algorithm must not be treated as a validated murmur source or used to expand
 classifier experiments.
+
+## Full-dataset observation export
+
+The audit can now enumerate every exact WAV/TSV pair instead of selecting one
+representative location per patient. Present-patient recordings are scored as
+`Present` only at locations listed in `Murmur locations`; other locations are
+kept as `Unknown` rather than incorrectly used as either positive or negative
+controls. On the inspected snapshot this yields 3,162 exact pairs because the
+known `50782_MV_1.wav` mismatch is excluded.
+
+Long runs have an atomic per-recording checkpoint and a lightweight `summary`
+profile. Resume validates the configuration hash, requested method, recording
+scope, and output profile before reusing rows. Invalid cardiac cycles are
+skipped with their reason saved separately rather than terminating the batch.
+
+For accepted candidates at location-aware Present recordings, observation
+features are calculated inside the detected systolic activity interval:
+
+- onset and offset relative to systole, the cardiac-cycle context, and the
+  original recording;
+- peak, RMS, mean absolute, envelope, and crest-factor amplitude;
+- dominant frequency, centroid, bandwidth, and spectral entropy;
+- Welch PSD peak and energy fractions in six frequency bands;
+- spectrogram peak time/frequency, time-frequency entropy, and spectral flux.
+
+PSD frequency resolution and spectrogram frame count/window resolution are
+exported beside those values. A one-frame spectrogram is retained for audit but
+must not be interpreted as evidence of frequency evolution over time.
+
+`adaptive_envelope` and `energy_quantile_fallback` timing results remain
+explicitly separated, and fallback separation candidates are excluded from the
+observation export. These measurements support descriptive observation and
+interpretation; they do not establish a clean murmur ground truth.

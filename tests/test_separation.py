@@ -12,11 +12,20 @@ from src.separation.core import (
     separate_signal,
 )
 from src.separation.audit import (
+    CardiacCycleContext,
+    _absolute_timing_metrics,
+    _all_recordings,
+    _should_save_package,
     build_cardiac_cycle_context,
     classify_audit_outcome,
     summarize_audit_quality,
+    summarize_murmur_observations,
 )
-from src.separation.metrics import detect_activity_interval, real_proxy_metrics
+from src.separation.metrics import (
+    detect_activity_interval,
+    murmur_observation_features,
+    real_proxy_metrics,
+)
 from src.ssa import select_component_count, ssa_decompose_audited
 
 
@@ -240,6 +249,30 @@ def test_valid_short_candidates_have_finite_timing(duration_ms: int) -> None:
     ]
     assert all(value is not None and np.isfinite(value) for value in timing_values)
     assert 0 <= timing["onset_normalized"] < timing["offset_normalized"] <= 1
+    assert timing["onset_sample"] is not None
+    assert timing["offset_sample"] is not None
+    assert timing["onset_seconds"] == pytest.approx(
+        timing["onset_sample"] / sample_rate
+    )
+    assert timing["offset_seconds"] == pytest.approx(
+        timing["offset_sample"] / sample_rate
+    )
+
+
+def test_murmur_observation_features_capture_tone_and_amplitude() -> None:
+    sample_rate = 4000
+    time = np.arange(int(0.2 * sample_rate)) / sample_rate
+    signal = 0.4 * np.sin(2 * np.pi * 180 * time)
+    features = murmur_observation_features(signal, sample_rate)
+    assert features["amplitude_peak_abs"] == pytest.approx(0.4, rel=0.02)
+    assert features["amplitude_rms"] == pytest.approx(0.4 / np.sqrt(2), rel=0.03)
+    assert features["psd_peak_frequency_hz"] == pytest.approx(180, abs=10)
+    assert features["psd_100_200_hz_ratio"] > 0.9
+    assert features["time_frequency_peak_hz"] == pytest.approx(180, abs=20)
+    assert features["time_frequency_frame_count"] > 1
+    assert features["time_frequency_frequency_resolution_hz"] > 0
+    assert np.isfinite(features["time_frequency_entropy"])
+    assert np.isfinite(features["time_frequency_spectral_flux"])
 
 
 def test_full_cycle_proxy_metrics_compute_phase_leakage() -> None:
@@ -336,3 +369,130 @@ def test_cycle_context_rejects_boundary_overlap_beyond_tolerance() -> None:
     )
     with pytest.raises(ValueError, match="exceeding .* tolerance"):
         build_cardiac_cycle_context(signal, annotations, 1, sample_rate)
+
+
+def test_absolute_timing_is_exported_in_recording_seconds() -> None:
+    sample_rate = 1000
+    length = 500
+    bounds = {
+        "s1": (0, 100),
+        "systole": (100, 200),
+        "s2": (200, 300),
+        "diastole": (300, 500),
+    }
+    masks = {}
+    for phase, (start, end) in bounds.items():
+        mask = np.zeros(length, dtype=bool)
+        mask[start:end] = True
+        masks[phase] = mask
+    cycle = CardiacCycleContext(
+        signal=np.zeros(length),
+        phase_masks=masks,
+        phase_bounds=bounds,
+        context_start_sample=2000,
+        context_end_sample=2500,
+    )
+    timing = _absolute_timing_metrics(
+        {
+            "onset_sample": 20,
+            "offset_sample": 80,
+            "candidate_quality_status": "accepted",
+            "activity_detection_method": "adaptive_envelope",
+        },
+        cycle,
+        sample_rate,
+    )
+    assert timing["murmur_onset_systole_seconds"] == pytest.approx(0.02)
+    assert timing["murmur_offset_systole_seconds"] == pytest.approx(0.08)
+    assert timing["murmur_onset_cycle_seconds"] == pytest.approx(0.12)
+    assert timing["murmur_offset_cycle_seconds"] == pytest.approx(0.18)
+    assert timing["murmur_onset_recording_seconds"] == pytest.approx(2.12)
+    assert timing["murmur_offset_recording_seconds"] == pytest.approx(2.18)
+    assert timing["timing_quality_status"] == "accepted_adaptive"
+
+
+def test_all_recordings_uses_exact_pairs_and_location_labels(tmp_path: Path) -> None:
+    metadata = pd.DataFrame(
+        [
+            {
+                "Patient ID": "111",
+                "Murmur": "Present",
+                "Murmur locations": "AV+PV",
+                "Systolic murmur timing": "Early-systolic",
+            },
+            {
+                "Patient ID": "222",
+                "Murmur": "Absent",
+                "Murmur locations": np.nan,
+                "Systolic murmur timing": np.nan,
+            },
+        ]
+    )
+    for recording_id in ("111_AV", "111_MV_1", "222_PV"):
+        (tmp_path / f"{recording_id}.wav").touch()
+        (tmp_path / f"{recording_id}.tsv").touch()
+    (tmp_path / "111_PV.wav").touch()
+    (tmp_path / "999_AV.wav").touch()
+    (tmp_path / "999_AV.tsv").touch()
+
+    rows = _all_recordings(metadata, 0, audio_dir=tmp_path)
+    labels = {row["recording_id"]: row["murmur_label"] for row in rows}
+    assert labels == {
+        "111_AV": "Present",
+        "111_MV_1": "Unknown",
+        "222_PV": "Absent",
+    }
+    assert next(row for row in rows if row["recording_id"] == "111_MV_1")[
+        "location"
+    ] == "MV"
+
+
+@pytest.mark.parametrize(
+    ("profile", "status", "expected"),
+    [
+        ("full", "fallback", True),
+        ("accepted", "accepted", True),
+        ("accepted", "fallback", False),
+        ("summary", "accepted", False),
+    ],
+)
+def test_output_profile_controls_heavy_packages(
+    profile: str, status: str, expected: bool
+) -> None:
+    assert _should_save_package(profile, status) is expected
+
+
+def test_observation_summary_only_uses_accepted_present_candidates() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "murmur_label": "Present",
+                "candidate_quality_status": "accepted",
+                "timing_label": "Early-systolic",
+                "activity_detection_method": "adaptive_envelope",
+                "amplitude_rms": 0.2,
+                "psd_peak_frequency_hz": 180.0,
+            },
+            {
+                "murmur_label": "Present",
+                "candidate_quality_status": "fallback",
+                "timing_label": "Early-systolic",
+                "activity_detection_method": "adaptive_envelope",
+                "amplitude_rms": 9.0,
+                "psd_peak_frequency_hz": 900.0,
+            },
+            {
+                "murmur_label": "Absent",
+                "candidate_quality_status": "accepted",
+                "timing_label": "nan",
+                "activity_detection_method": "adaptive_envelope",
+                "amplitude_rms": 8.0,
+                "psd_peak_frequency_hz": 800.0,
+            },
+        ]
+    )
+    observation = summarize_murmur_observations(frame)
+    assert len(observation) == 1
+    assert observation.loc[0, "segment_count"] == 1
+    assert observation.loc[0, "amplitude_rms_mean"] == pytest.approx(0.2)
+    assert observation.loc[0, "psd_peak_frequency_hz_mean"] == pytest.approx(180)
