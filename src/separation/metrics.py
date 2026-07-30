@@ -3,10 +3,287 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import hilbert, spectrogram, welch
+from scipy.signal import (
+    find_peaks,
+    hilbert,
+    peak_widths,
+    savgol_filter,
+    spectrogram,
+    welch,
+)
 
 
 EPSILON = 1e-12
+
+
+def smooth_amplitude_envelope(signal: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Return a deterministic short-window envelope for morphology analysis."""
+
+    values = np.asarray(signal, dtype=float)
+    if values.size == 0:
+        return np.asarray([], dtype=float)
+    envelope = np.abs(hilbert(values)) if len(values) > 2 else np.abs(values)
+    if len(values) < 5:
+        return envelope
+    window = min(
+        len(values) if len(values) % 2 else len(values) - 1,
+        max(5, int(round(sample_rate * 0.012)) | 1),
+    )
+    if window < 5:
+        return envelope
+    return np.maximum(savgol_filter(envelope, window, 2, mode="interp"), 0.0)
+
+
+def dominant_frequency_trajectory(
+    signal: np.ndarray, sample_rate: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return spectrogram frame times and the dominant-frequency ridge."""
+
+    values = np.asarray(signal, dtype=float)
+    if values.size < 4 or energy(values) <= EPSILON:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    nperseg = min(128, len(values))
+    frequencies, times, power = spectrogram(
+        values,
+        fs=sample_rate,
+        nperseg=nperseg,
+        noverlap=nperseg // 2,
+        detrend="constant",
+    )
+    band = (frequencies >= 20.0) & (frequencies <= min(1000.0, sample_rate / 2))
+    if not band.any() or power.shape[1] == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    band_frequencies = frequencies[band]
+    ridge = band_frequencies[np.argmax(power[band], axis=0)]
+    return times.astype(float), ridge.astype(float)
+
+
+def _contiguous_intervals(mask: np.ndarray) -> list[tuple[int, int]]:
+    changes = np.diff(np.pad(np.asarray(mask, dtype=np.int8), (1, 1)))
+    return [
+        (int(start), int(end))
+        for start, end in zip(
+            np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)
+        )
+    ]
+
+
+def _envelope_morphology(
+    envelope: np.ndarray, sample_rate: int
+) -> dict[str, float | str]:
+    n_samples = len(envelope)
+    if n_samples < 5 or float(np.max(envelope, initial=0.0)) <= EPSILON:
+        return {
+            "envelope_shape": "insufficient",
+            "envelope_time_to_peak_ratio": 0.0,
+            "envelope_rise_time_seconds": 0.0,
+            "envelope_decay_time_seconds": 0.0,
+            "envelope_rising_slope_normalized": 0.0,
+            "envelope_falling_slope_normalized": 0.0,
+            "envelope_variation_coefficient": 0.0,
+            "envelope_area_normalized": 0.0,
+            "envelope_symmetry": 0.0,
+            "envelope_prominent_peak_count": 0.0,
+            "active_burst_count": 0.0,
+            "active_time_ratio": 0.0,
+            "longest_burst_ratio": 0.0,
+        }
+
+    edge = min(max(1, int(round(0.04 * n_samples))), max(1, n_samples // 4))
+    stop = max(edge + 1, n_samples - edge)
+    interior = envelope[edge:stop]
+    peak_index = edge + int(np.argmax(interior))
+    peak = float(envelope[peak_index])
+    normalized = envelope / (peak + EPSILON)
+    x = np.linspace(0.0, 1.0, n_samples)
+    time_to_peak = peak_index / max(1, n_samples - 1)
+
+    def fitted_slope(start: int, end: int) -> float:
+        if end - start < 3:
+            return 0.0
+        return float(np.polyfit(x[start:end], normalized[start:end], 1)[0])
+
+    rising_slope = fitted_slope(0, peak_index + 1)
+    falling_slope = fitted_slope(peak_index, n_samples)
+    segment = max(1, n_samples // 5)
+    start_level = float(np.mean(normalized[:segment]))
+    middle_start = max(0, n_samples // 2 - segment // 2)
+    middle_level = float(np.mean(normalized[middle_start : middle_start + segment]))
+    end_level = float(np.mean(normalized[-segment:]))
+    coefficient_variation = float(
+        np.std(envelope) / (float(np.mean(envelope)) + EPSILON)
+    )
+    robust_range = float(np.percentile(normalized, 90) - np.percentile(normalized, 10))
+
+    distance = max(1, int(round(0.08 * n_samples)))
+    peaks, _ = find_peaks(normalized, prominence=0.12, distance=distance)
+    prominent_peak_count = len(peaks)
+
+    if coefficient_variation < 0.12 or robust_range < 0.20:
+        shape = "constant"
+    elif end_level - start_level > 0.25 and end_level >= 0.90 * middle_level:
+        shape = "crescendo"
+    elif start_level - end_level > 0.25 and start_level >= 0.90 * middle_level:
+        shape = "decrescendo"
+    elif (
+        0.18 <= time_to_peak <= 0.82
+        and middle_level > 1.20 * start_level
+        and middle_level > 1.20 * end_level
+    ):
+        shape = "crescendo_decrescendo"
+    elif prominent_peak_count >= 2:
+        shape = "multi_peak"
+    else:
+        shape = "irregular"
+
+    baseline = float(np.percentile(envelope, 20))
+    mad = float(np.median(np.abs(envelope - baseline)))
+    threshold = max(
+        baseline + 2.0 * 1.4826 * mad,
+        baseline + 0.20 * (float(np.max(envelope)) - baseline),
+    )
+    active = envelope >= threshold
+    minimum = max(1, min(int(round(0.005 * sample_rate)), n_samples // 10))
+    intervals = [
+        interval
+        for interval in _contiguous_intervals(active)
+        if interval[1] - interval[0] >= minimum
+    ]
+    active_samples = sum(end - start for start, end in intervals)
+    longest = max((end - start for start, end in intervals), default=0)
+    return {
+        "envelope_shape": shape,
+        "envelope_time_to_peak_ratio": float(time_to_peak),
+        "envelope_rise_time_seconds": float(peak_index / sample_rate),
+        "envelope_decay_time_seconds": float((n_samples - 1 - peak_index) / sample_rate),
+        "envelope_rising_slope_normalized": rising_slope,
+        "envelope_falling_slope_normalized": falling_slope,
+        "envelope_variation_coefficient": coefficient_variation,
+        "envelope_area_normalized": float(np.mean(normalized)),
+        "envelope_symmetry": float(max(0.0, 1.0 - abs(2.0 * time_to_peak - 1.0))),
+        "envelope_prominent_peak_count": float(prominent_peak_count),
+        "active_burst_count": float(len(intervals)),
+        "active_time_ratio": float(active_samples / n_samples),
+        "longest_burst_ratio": float(longest / n_samples),
+    }
+
+
+def _psd_morphology(
+    frequencies: np.ndarray, psd: np.ndarray
+) -> dict[str, float | str]:
+    resolution = float(frequencies[1] - frequencies[0]) if len(frequencies) > 1 else 0.0
+    band = (frequencies >= 20.0) & (frequencies <= 1000.0)
+    band_frequencies = frequencies[band]
+    band_psd = psd[band]
+    if band_psd.size < 3 or float(np.max(band_psd, initial=0.0)) <= EPSILON:
+        return {
+            "psd_morphology": "insufficient",
+            "psd_primary_peak_frequency_hz": 0.0,
+            "psd_prominent_peak_count": 0.0,
+            "psd_primary_peak_width_hz": 0.0,
+            "psd_primary_peak_prominence_ratio": 0.0,
+            "psd_secondary_peak_frequency_hz": 0.0,
+            "psd_secondary_to_primary_ratio": 0.0,
+            "psd_peak_separation_hz": 0.0,
+            "psd_primary_q_factor": 0.0,
+            "psd_energy_concentration": 0.0,
+        }
+    normalized = band_psd / (float(np.max(band_psd)) + EPSILON)
+    distance = max(1, int(round(40.0 / max(resolution, EPSILON))))
+    peaks, properties = find_peaks(normalized, prominence=0.10, distance=distance)
+    detected_peak = peaks.size > 0
+    if peaks.size == 0:
+        peaks = np.asarray([int(np.argmax(normalized))])
+        prominences = np.asarray([0.0])
+    else:
+        prominences = np.asarray(properties["prominences"], dtype=float)
+    order = np.argsort(normalized[peaks])[::-1]
+    peaks = peaks[order]
+    prominences = prominences[order]
+    primary = int(peaks[0])
+    primary_frequency = float(band_frequencies[primary])
+    if detected_peak:
+        widths, _, left, right = peak_widths(normalized, [primary], rel_height=0.5)
+        width_hz = float(max(resolution, widths[0] * resolution))
+        left_index = max(0, int(np.floor(left[0])))
+        right_index = min(len(band_psd), int(np.ceil(right[0])) + 1)
+    else:
+        width_hz = resolution
+        left_index = primary
+        right_index = primary + 1
+    concentration = float(
+        np.sum(band_psd[left_index:right_index]) / (np.sum(band_psd) + EPSILON)
+    )
+    secondary_frequency = 0.0
+    secondary_ratio = 0.0
+    separation = 0.0
+    if len(peaks) > 1:
+        secondary = int(peaks[1])
+        secondary_frequency = float(band_frequencies[secondary])
+        secondary_ratio = float(normalized[secondary] / (normalized[primary] + EPSILON))
+        separation = abs(secondary_frequency - primary_frequency)
+    q_factor = primary_frequency / (width_hz + EPSILON)
+    peak_count = int(np.sum(normalized[peaks] >= 0.15))
+    primary_prominence = float(prominences[0]) if len(prominences) else 0.0
+    if primary_prominence < 0.10:
+        morphology = "no_clear_peak"
+    elif peak_count >= 3:
+        morphology = "multi_peak"
+    elif peak_count == 2 and secondary_ratio >= 0.25:
+        morphology = "double_peak"
+    elif q_factor >= 4.0:
+        morphology = "narrow_single_peak"
+    else:
+        morphology = "broad_single_peak"
+    return {
+        "psd_morphology": morphology,
+        "psd_primary_peak_frequency_hz": primary_frequency,
+        "psd_prominent_peak_count": float(peak_count),
+        "psd_primary_peak_width_hz": width_hz,
+        "psd_primary_peak_prominence_ratio": primary_prominence,
+        "psd_secondary_peak_frequency_hz": secondary_frequency,
+        "psd_secondary_to_primary_ratio": secondary_ratio,
+        "psd_peak_separation_hz": float(separation),
+        "psd_primary_q_factor": float(q_factor),
+        "psd_energy_concentration": concentration,
+    }
+
+
+def _ridge_morphology(
+    times: np.ndarray, ridge: np.ndarray, frequency_resolution: float
+) -> dict[str, float | str]:
+    if len(times) < 3 or len(ridge) != len(times):
+        return {
+            "time_frequency_ridge_direction": "insufficient",
+            "time_frequency_ridge_start_hz": 0.0,
+            "time_frequency_ridge_end_hz": 0.0,
+            "time_frequency_ridge_slope_hz_per_second": 0.0,
+            "time_frequency_ridge_variability_hz": 0.0,
+            "time_frequency_ridge_continuity": 0.0,
+        }
+    slope, intercept = np.polyfit(times, ridge, 1)
+    fitted = slope * times + intercept
+    edge_frames = min(2, len(ridge))
+    start = float(np.median(ridge[:edge_frames]))
+    end = float(np.median(ridge[-edge_frames:]))
+    total_change = float(slope * (times[-1] - times[0]))
+    threshold = max(2.0 * frequency_resolution, 50.0)
+    if total_change > threshold:
+        direction = "rising"
+    elif total_change < -threshold:
+        direction = "falling"
+    else:
+        direction = "stable"
+    jumps = np.abs(np.diff(ridge))
+    continuity = float(np.mean(jumps <= max(2.0 * frequency_resolution, 100.0)))
+    return {
+        "time_frequency_ridge_direction": direction,
+        "time_frequency_ridge_start_hz": start,
+        "time_frequency_ridge_end_hz": end,
+        "time_frequency_ridge_slope_hz_per_second": float(slope),
+        "time_frequency_ridge_variability_hz": float(np.std(ridge - fitted)),
+        "time_frequency_ridge_continuity": continuity,
+    }
 
 
 def safe_correlation(left: np.ndarray, right: np.ndarray) -> float:
@@ -48,8 +325,8 @@ def spectral_features(signal: np.ndarray, sample_rate: int) -> dict[str, float]:
 
 def murmur_observation_features(
     signal: np.ndarray, sample_rate: int
-) -> dict[str, float]:
-    """Return compact amplitude, PSD, and time-frequency murmur descriptors."""
+) -> dict[str, float | str]:
+    """Return amplitude, morphology, PSD, and time-frequency descriptors."""
 
     values = np.asarray(signal, dtype=float)
     empty = (
@@ -81,16 +358,22 @@ def murmur_observation_features(
             "time_frequency_window_seconds": 0.0,
             "time_frequency_entropy": 0.0,
             "time_frequency_spectral_flux": 0.0,
+            **_envelope_morphology(np.asarray([], dtype=float), sample_rate),
+            **_psd_morphology(np.asarray([], dtype=float), np.asarray([], dtype=float)),
+            **_ridge_morphology(
+                np.asarray([], dtype=float), np.asarray([], dtype=float), 0.0
+            ),
         }
 
     envelope = np.abs(hilbert(values)) if len(values) > 2 else np.abs(values)
+    smooth_envelope = smooth_amplitude_envelope(values, sample_rate)
     peak = float(np.max(np.abs(values)))
     rms = float(np.sqrt(np.mean(values**2)))
 
     psd_frequencies, psd = welch(
         values,
         fs=sample_rate,
-        nperseg=min(256, len(values)),
+        nperseg=min(512, len(values)),
         detrend="constant",
     )
     psd_total = float(np.sum(psd)) + EPSILON
@@ -125,6 +408,8 @@ def murmur_observation_features(
             spectral_flux = float(
                 np.mean(np.sqrt(np.sum(np.diff(frame_power, axis=1) ** 2, axis=0)))
             )
+    ridge_times, ridge = dominant_frequency_trajectory(values, sample_rate)
+    frequency_resolution = float(sample_rate / nperseg)
 
     return {
         "amplitude_peak_abs": peak,
@@ -135,7 +420,7 @@ def murmur_observation_features(
         "amplitude_crest_factor": peak / (rms + EPSILON),
         "psd_peak_frequency_hz": float(psd_frequencies[int(np.argmax(psd))]),
         "psd_peak_power": float(np.max(psd)),
-        "psd_frequency_resolution_hz": float(sample_rate / min(256, len(values))),
+        "psd_frequency_resolution_hz": float(sample_rate / min(512, len(values))),
         "psd_0_100_hz_ratio": band_ratio(0, 100),
         "psd_100_200_hz_ratio": band_ratio(100, 200),
         "psd_200_400_hz_ratio": band_ratio(200, 400),
@@ -149,6 +434,9 @@ def murmur_observation_features(
         "time_frequency_window_seconds": float(nperseg / sample_rate),
         "time_frequency_entropy": float(tf_entropy),
         "time_frequency_spectral_flux": spectral_flux,
+        **_envelope_morphology(smooth_envelope, sample_rate),
+        **_psd_morphology(psd_frequencies, psd),
+        **_ridge_morphology(ridge_times, ridge, frequency_resolution),
     }
 
 

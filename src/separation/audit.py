@@ -33,7 +33,11 @@ from src.separation.core import (
     compare_separation_methods,
     separate_signal,
 )
-from src.separation.metrics import real_proxy_metrics
+from src.separation.metrics import (
+    dominant_frequency_trajectory,
+    real_proxy_metrics,
+    smooth_amplitude_envelope,
+)
 
 
 OBSERVATION_METRICS = [
@@ -55,6 +59,19 @@ OBSERVATION_METRICS = [
     "amplitude_envelope_peak",
     "amplitude_envelope_mean",
     "amplitude_crest_factor",
+    "envelope_shape",
+    "envelope_time_to_peak_ratio",
+    "envelope_rise_time_seconds",
+    "envelope_decay_time_seconds",
+    "envelope_rising_slope_normalized",
+    "envelope_falling_slope_normalized",
+    "envelope_variation_coefficient",
+    "envelope_area_normalized",
+    "envelope_symmetry",
+    "envelope_prominent_peak_count",
+    "active_burst_count",
+    "active_time_ratio",
+    "longest_burst_ratio",
     "residual_dominant_frequency",
     "residual_spectral_centroid",
     "residual_bandwidth",
@@ -68,6 +85,16 @@ OBSERVATION_METRICS = [
     "psd_400_800_hz_ratio",
     "psd_800_1000_hz_ratio",
     "psd_above_1000_hz_ratio",
+    "psd_morphology",
+    "psd_primary_peak_frequency_hz",
+    "psd_prominent_peak_count",
+    "psd_primary_peak_width_hz",
+    "psd_primary_peak_prominence_ratio",
+    "psd_secondary_peak_frequency_hz",
+    "psd_secondary_to_primary_ratio",
+    "psd_peak_separation_hz",
+    "psd_primary_q_factor",
+    "psd_energy_concentration",
     "time_frequency_peak_hz",
     "time_frequency_peak_seconds",
     "time_frequency_peak_cycle_seconds",
@@ -77,6 +104,12 @@ OBSERVATION_METRICS = [
     "time_frequency_window_seconds",
     "time_frequency_entropy",
     "time_frequency_spectral_flux",
+    "time_frequency_ridge_direction",
+    "time_frequency_ridge_start_hz",
+    "time_frequency_ridge_end_hz",
+    "time_frequency_ridge_slope_hz_per_second",
+    "time_frequency_ridge_variability_hz",
+    "time_frequency_ridge_continuity",
 ]
 
 
@@ -394,16 +427,60 @@ def summarize_murmur_observations(summary: pd.DataFrame) -> pd.DataFrame:
         summary["murmur_label"].eq("Present")
         & summary["candidate_quality_status"].eq("accepted")
     ].copy()
-    available_metrics = [name for name in OBSERVATION_METRICS if name in selected]
+    available_metrics = [
+        name
+        for name in OBSERVATION_METRICS
+        if name in selected and pd.api.types.is_numeric_dtype(selected[name])
+    ]
     if selected.empty or not available_metrics:
         return pd.DataFrame(columns=base_columns)
     group_columns = ["timing_label", "activity_detection_method"]
     grouped = selected.groupby(group_columns, dropna=False, sort=True)
     result = grouped.size().rename("segment_count").to_frame()
-    for metric in available_metrics:
-        result[f"{metric}_mean"] = grouped[metric].mean()
-        result[f"{metric}_median"] = grouped[metric].median()
+    aggregates = grouped[available_metrics].agg(["mean", "median"])
+    aggregates.columns = [
+        f"{metric}_{statistic}" for metric, statistic in aggregates.columns
+    ]
+    result = result.join(aggregates)
     return result.reset_index()
+
+
+def summarize_murmur_morphology_categories(summary: pd.DataFrame) -> pd.DataFrame:
+    """Count rule-based morphology labels among accepted Present candidates."""
+
+    columns = ["timing_label", "dimension", "category", "segment_count", "ratio"]
+    required = {"murmur_label", "candidate_quality_status", "timing_label"}
+    if summary.empty or not required.issubset(summary.columns):
+        return pd.DataFrame(columns=columns)
+    selected = summary[
+        summary["murmur_label"].eq("Present")
+        & summary["candidate_quality_status"].eq("accepted")
+    ]
+    dimensions = [
+        name
+        for name in (
+            "envelope_shape",
+            "psd_morphology",
+            "time_frequency_ridge_direction",
+        )
+        if name in selected
+    ]
+    rows: list[dict[str, Any]] = []
+    for timing_label, group in selected.groupby("timing_label", dropna=False):
+        for dimension in dimensions:
+            counts = group[dimension].fillna("missing").astype(str).value_counts()
+            total = int(counts.sum())
+            for category, count in counts.items():
+                rows.append(
+                    {
+                        "timing_label": timing_label,
+                        "dimension": dimension,
+                        "category": category,
+                        "segment_count": int(count),
+                        "ratio": float(count / total) if total else 0.0,
+                    }
+                )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def _write_checkpoint(rows: list[dict[str, Any]], destination: Path) -> None:
@@ -463,8 +540,39 @@ def _write_diagnostic_plot(
     axes[3].set_title("Murmur candidate")
     axes[4].plot(time, result.noise_candidate, linewidth=0.7)
     axes[4].set_title("Noise/artifact candidate")
-    axes[5].plot(time, np.abs(hilbert(result.murmur_candidate)), linewidth=0.7)
-    axes[5].set_title("Murmur-candidate amplitude envelope")
+    axes[5].plot(
+        time,
+        np.abs(hilbert(result.murmur_candidate)),
+        linewidth=0.6,
+        alpha=0.45,
+        label="raw Hilbert envelope",
+    )
+    observation_time = (
+        np.arange(len(observation_candidate)) + observation_start
+    ) / sample_rate
+    smooth_envelope = smooth_amplitude_envelope(observation_candidate, sample_rate)
+    axes[5].plot(
+        observation_time,
+        smooth_envelope,
+        color="tab:red",
+        linewidth=1.5,
+        label="smoothed detected interval",
+    )
+    if len(smooth_envelope):
+        peak_index = int(np.argmax(smooth_envelope))
+        axes[5].scatter(
+            observation_time[peak_index],
+            smooth_envelope[peak_index],
+            color="black",
+            s=18,
+            zorder=3,
+            label="envelope peak",
+        )
+    axes[5].set_title(
+        "Amplitude envelope — "
+        f"{result.metrics.get('envelope_shape', 'not characterized')}"
+    )
+    axes[5].legend(loc="upper right", fontsize=8)
     if onset_seconds is not None and offset_seconds is not None:
         for axis in (axes[3], axes[5]):
             axis.axvline(float(onset_seconds), color="tab:red", linestyle="--")
@@ -472,9 +580,36 @@ def _write_diagnostic_plot(
     axes[6].psd(
         observation_candidate,
         Fs=sample_rate,
-        NFFT=min(256, len(observation_candidate)),
+        NFFT=min(512, len(observation_candidate)),
     )
-    axes[6].set_title("Detected murmur-candidate interval PSD")
+    primary_frequency = float(
+        result.metrics.get("psd_primary_peak_frequency_hz", 0.0) or 0.0
+    )
+    secondary_frequency = float(
+        result.metrics.get("psd_secondary_peak_frequency_hz", 0.0) or 0.0
+    )
+    if primary_frequency > 0:
+        axes[6].axvline(
+            primary_frequency,
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"primary {primary_frequency:.0f} Hz",
+        )
+    if secondary_frequency > 0:
+        axes[6].axvline(
+            secondary_frequency,
+            color="tab:orange",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"secondary {secondary_frequency:.0f} Hz",
+        )
+    axes[6].set_title(
+        "Detected interval PSD — "
+        f"{result.metrics.get('psd_morphology', 'not characterized')}"
+    )
+    if primary_frequency > 0:
+        axes[6].legend(loc="upper right", fontsize=8)
     frequencies, times, power = spectrogram(
         observation_candidate,
         fs=sample_rate,
@@ -500,8 +635,25 @@ def _write_diagnostic_plot(
         )
     else:
         axes[7].pcolormesh(times, frequencies, power_db, shading="auto")
+    ridge_times, ridge = dominant_frequency_trajectory(
+        observation_candidate, sample_rate
+    )
+    if len(ridge_times):
+        axes[7].plot(
+            ridge_times + observation_start / sample_rate,
+            ridge,
+            color="white",
+            linewidth=1.2,
+            marker=".",
+            markersize=2,
+            label="dominant-frequency trajectory",
+        )
+        axes[7].legend(loc="upper right", fontsize=8)
     axes[7].set_ylim(0, min(1000, sample_rate / 2))
-    axes[7].set_title("Detected murmur-candidate interval spectrogram")
+    axes[7].set_title(
+        "Detected interval spectrogram — frequency "
+        f"{result.metrics.get('time_frequency_ridge_direction', 'not characterized')}"
+    )
     assignments = result.assignments
     axes[8].bar(
         [row["component_index"] for row in result.component_features],
@@ -540,6 +692,17 @@ def _write_diagnostic_plot(
             "timing_quality_status",
             "murmur_onset_recording_seconds",
             "murmur_offset_recording_seconds",
+            "envelope_shape",
+            "envelope_time_to_peak_ratio",
+            "active_burst_count",
+            "active_time_ratio",
+            "psd_morphology",
+            "psd_primary_peak_frequency_hz",
+            "psd_primary_peak_width_hz",
+            "psd_prominent_peak_count",
+            "time_frequency_ridge_direction",
+            "time_frequency_ridge_slope_hz_per_second",
+            "time_frequency_ridge_variability_hz",
         }
     ]
     def preview(indexes: list[int]) -> str:
@@ -895,6 +1058,9 @@ def run_audit(
     summarize_murmur_observations(summary).to_csv(
         REPORT_OUTPUT_DIR / f"murmur_observation_summary{suffix}.csv", index=False
     )
+    summarize_murmur_morphology_categories(summary).to_csv(
+        REPORT_OUTPUT_DIR / f"murmur_morphology_summary{suffix}.csv", index=False
+    )
     skipped = pd.DataFrame(skipped_rows)
     if skipped.empty:
         skipped = pd.DataFrame(
@@ -1017,6 +1183,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Observation summary: "
         f"{REPORT_OUTPUT_DIR / f'murmur_observation_summary{suffix}.csv'}"
+    )
+    print(
+        "Morphology summary: "
+        f"{REPORT_OUTPUT_DIR / f'murmur_morphology_summary{suffix}.csv'}"
     )
     return 0
 

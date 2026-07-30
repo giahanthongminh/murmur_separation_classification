@@ -150,9 +150,14 @@ features are calculated inside the detected systolic activity interval:
 - onset and offset relative to systole, the cardiac-cycle context, and the
   original recording;
 - peak, RMS, mean absolute, envelope, and crest-factor amplitude;
+- smoothed-envelope shape, time to peak, rise/decay, symmetry, active-burst
+  count, and active-duration ratios;
 - dominant frequency, centroid, bandwidth, and spectral entropy;
-- Welch PSD peak and energy fractions in six frequency bands;
-- spectrogram peak time/frequency, time-frequency entropy, and spectral flux.
+- Welch PSD peak count, half-height width, prominence, secondary-peak ratio,
+  peak energy concentration, and energy fractions in six frequency bands;
+- spectrogram peak time/frequency, time-frequency entropy, spectral flux, and
+  the direction, slope, variability, and continuity of its dominant-frequency
+  trajectory.
 
 PSD frequency resolution and spectrogram frame count/window resolution are
 exported beside those values. A one-frame spectrogram is retained for audit but
@@ -161,4 +166,11 @@ must not be interpreted as evidence of frequency evolution over time.
 `adaptive_envelope` and `energy_quantile_fallback` timing results remain
 explicitly separated, and fallback separation candidates are excluded from the
 observation export. These measurements support descriptive observation and
-interpretation; they do not establish a clean murmur ground truth.
+interpretation; they do not establish a clean murmur ground truth. Envelope,
+PSD, and frequency-trajectory labels are deterministic morphology summaries
+for human review, not clinical diagnoses. Diagnostic plots overlay the
+smoothed detected-interval envelope, annotated PSD peaks, and the
+dominant-frequency trajectory so each exported description can be checked
+against the candidate waveform. `murmur_morphology_summary_<run>.csv` counts
+each envelope, PSD, and frequency-trajectory category within each murmur timing
+label, exposing dataset diversity without averaging categorical descriptions.
