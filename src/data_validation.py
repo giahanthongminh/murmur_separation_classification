@@ -14,6 +14,7 @@ import pandas as pd
 from scipy.io import wavfile
 
 from config import (
+    ANNOTATION_BOUNDARY_TOLERANCE_SECONDS,
     AUDIO_DIR,
     DATASET_ROOT,
     EXPECTED_PATIENTS,
@@ -217,7 +218,10 @@ def validate_dataset(
             starts = table["start"].to_numpy()
             ends = table["end"].to_numpy()
             # Public annotations contain sub-millisecond boundary rounding.
-            if len(table) > 1 and np.any(starts[1:] < ends[:-1] - 1e-3):
+            if len(table) > 1 and np.any(
+                starts[1:]
+                < ends[:-1] - ANNOTATION_BOUNDARY_TOLERANCE_SECONDS
+            ):
                 raise ValueError("annotation intervals overlap or are out of order")
         except Exception as exc:
             invalid_annotations.append({"file": path.name, "detail": str(exc)})

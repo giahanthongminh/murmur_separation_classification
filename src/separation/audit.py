@@ -18,6 +18,7 @@ from scipy.io import wavfile
 from scipy.signal import hilbert, resample_poly, spectrogram
 
 from config import (
+    ANNOTATION_BOUNDARY_TOLERANCE_SECONDS,
     AUDIO_DIR,
     DEFAULT_SEPARATION_CONFIG,
     METADATA_PATH,
@@ -109,10 +110,36 @@ def build_cardiac_cycle_context(
                 f"{expected_states[phase]}, found {state}"
             )
 
-    absolute_bounds = {
+    absolute_bounds: dict[str, tuple[int, int]] = {
         phase: _annotation_sample_bounds(table.iloc[position], sample_rate, len(signal))
         for phase, position in required_positions.items()
     }
+    ordered_phases = ("s1", "systole", "s2", "diastole")
+    for left_phase, right_phase in zip(ordered_phases, ordered_phases[1:]):
+        left_annotation = table.iloc[required_positions[left_phase]]
+        right_annotation = table.iloc[required_positions[right_phase]]
+        left_end_seconds = float(left_annotation["end"])
+        right_start_seconds = float(right_annotation["start"])
+        boundary_delta = right_start_seconds - left_end_seconds
+        if abs(boundary_delta) > ANNOTATION_BOUNDARY_TOLERANCE_SECONDS:
+            relation = "gap" if boundary_delta > 0 else "overlap"
+            raise ValueError(
+                f"cardiac phase boundary {left_phase}->{right_phase} has "
+                f"{abs(boundary_delta):.6f}s {relation}, exceeding "
+                f"{ANNOTATION_BOUNDARY_TOLERANCE_SECONDS:.6f}s tolerance"
+            )
+        shared_boundary = int(
+            round(
+                (left_end_seconds + right_start_seconds)
+                * 0.5
+                * sample_rate
+            )
+        )
+        shared_boundary = max(0, min(shared_boundary, len(signal)))
+        left_start, _ = absolute_bounds[left_phase]
+        _, right_end = absolute_bounds[right_phase]
+        absolute_bounds[left_phase] = (left_start, shared_boundary)
+        absolute_bounds[right_phase] = (shared_boundary, right_end)
     context_start = absolute_bounds["s1"][0]
     context_end = absolute_bounds["diastole"][1]
     if context_end <= context_start:
