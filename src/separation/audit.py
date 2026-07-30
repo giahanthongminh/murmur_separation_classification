@@ -36,6 +36,50 @@ from src.separation.core import (
 from src.separation.metrics import real_proxy_metrics
 
 
+OBSERVATION_METRICS = [
+    "onset_normalized",
+    "offset_normalized",
+    "duration_ratio",
+    "temporal_energy_centroid",
+    "peak_position",
+    "murmur_onset_systole_seconds",
+    "murmur_offset_systole_seconds",
+    "murmur_duration_seconds",
+    "murmur_onset_cycle_seconds",
+    "murmur_offset_cycle_seconds",
+    "murmur_onset_recording_seconds",
+    "murmur_offset_recording_seconds",
+    "amplitude_peak_abs",
+    "amplitude_rms",
+    "amplitude_mean_abs",
+    "amplitude_envelope_peak",
+    "amplitude_envelope_mean",
+    "amplitude_crest_factor",
+    "residual_dominant_frequency",
+    "residual_spectral_centroid",
+    "residual_bandwidth",
+    "residual_spectral_entropy",
+    "psd_peak_frequency_hz",
+    "psd_peak_power",
+    "psd_frequency_resolution_hz",
+    "psd_0_100_hz_ratio",
+    "psd_100_200_hz_ratio",
+    "psd_200_400_hz_ratio",
+    "psd_400_800_hz_ratio",
+    "psd_800_1000_hz_ratio",
+    "psd_above_1000_hz_ratio",
+    "time_frequency_peak_hz",
+    "time_frequency_peak_seconds",
+    "time_frequency_peak_cycle_seconds",
+    "time_frequency_peak_recording_seconds",
+    "time_frequency_frame_count",
+    "time_frequency_frequency_resolution_hz",
+    "time_frequency_window_seconds",
+    "time_frequency_entropy",
+    "time_frequency_spectral_flux",
+]
+
+
 @dataclass(frozen=True)
 class CardiacCycleContext:
     """One contiguous S1-systole-S2-diastole cycle and its phase masks."""
@@ -207,6 +251,171 @@ def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[
     return selected
 
 
+def _metadata_locations(value: Any) -> set[str]:
+    """Parse CirCor's plus-separated location fields without treating NaN as text."""
+
+    if pd.isna(value):
+        return set()
+    return {item.strip() for item in str(value).split("+") if item.strip()}
+
+
+def _all_recordings(
+    metadata: pd.DataFrame,
+    limit: int,
+    *,
+    audio_dir: Path = AUDIO_DIR,
+) -> list[dict[str, str]]:
+    """Enumerate every exact WAV/TSV pair with conservative location-aware labels."""
+
+    patient_rows = {
+        str(row["Patient ID"]): row for _, row in metadata.iterrows()
+    }
+    selected: list[dict[str, str]] = []
+    for wav_path in sorted(audio_dir.glob("*.wav")):
+        recording_id = wav_path.stem
+        if not (audio_dir / f"{recording_id}.tsv").exists():
+            continue
+        parts = recording_id.split("_")
+        if len(parts) < 2 or parts[0] not in patient_rows:
+            continue
+        patient_id = parts[0]
+        location = parts[1]
+        row = patient_rows[patient_id]
+        patient_label = str(row.get("Murmur", "Unknown"))
+        murmur_locations = _metadata_locations(row.get("Murmur locations"))
+        if patient_label == "Absent":
+            murmur_label = "Absent"
+        elif patient_label == "Present" and location in murmur_locations:
+            murmur_label = "Present"
+        else:
+            # A patient-level Present label does not prove that every auscultation
+            # location contains murmur. Keep those recordings out of scored groups.
+            murmur_label = "Unknown"
+        timing = str(row.get("Systolic murmur timing", ""))
+        selected.append(
+            {
+                "patient_id": patient_id,
+                "recording_id": recording_id,
+                "location": location,
+                "murmur_label": murmur_label,
+                "patient_murmur_label": patient_label,
+                "timing_label": timing,
+                "audit_group": "All recordings",
+            }
+        )
+        if limit > 0 and len(selected) >= limit:
+            break
+    return selected
+
+
+def _absolute_timing_metrics(
+    metrics: dict[str, Any],
+    cycle: CardiacCycleContext,
+    sample_rate: int,
+) -> dict[str, Any]:
+    """Convert systole-relative detector output into cycle and recording seconds."""
+
+    onset = metrics.get("onset_sample")
+    offset = metrics.get("offset_sample")
+    quality = str(metrics.get("candidate_quality_status", "fallback"))
+    detection = str(metrics.get("activity_detection_method", "silent_or_invalid"))
+    if onset is None or offset is None:
+        return {
+            "murmur_onset_systole_seconds": None,
+            "murmur_offset_systole_seconds": None,
+            "murmur_duration_seconds": None,
+            "murmur_onset_cycle_seconds": None,
+            "murmur_offset_cycle_seconds": None,
+            "murmur_onset_recording_seconds": None,
+            "murmur_offset_recording_seconds": None,
+            "time_frequency_peak_cycle_seconds": None,
+            "time_frequency_peak_recording_seconds": None,
+            "timing_quality_status": "unavailable",
+        }
+    systole_start = cycle.phase_bounds["systole"][0]
+    onset = int(onset)
+    offset = int(offset)
+    time_frequency_peak = float(metrics.get("time_frequency_peak_seconds", 0.0))
+    if quality != "accepted":
+        timing_status = "low_confidence_candidate"
+    elif detection == "adaptive_envelope":
+        timing_status = "accepted_adaptive"
+    else:
+        timing_status = "accepted_energy_fallback"
+    return {
+        "murmur_onset_systole_seconds": onset / sample_rate,
+        "murmur_offset_systole_seconds": offset / sample_rate,
+        "murmur_duration_seconds": (offset - onset) / sample_rate,
+        "murmur_onset_cycle_seconds": (systole_start + onset) / sample_rate,
+        "murmur_offset_cycle_seconds": (systole_start + offset) / sample_rate,
+        "murmur_onset_recording_seconds": (
+            cycle.context_start_sample + systole_start + onset
+        )
+        / sample_rate,
+        "murmur_offset_recording_seconds": (
+            cycle.context_start_sample + systole_start + offset
+        )
+        / sample_rate,
+        "time_frequency_peak_cycle_seconds": (
+            (systole_start + onset) / sample_rate + time_frequency_peak
+        ),
+        "time_frequency_peak_recording_seconds": (
+            (cycle.context_start_sample + systole_start + onset) / sample_rate
+            + time_frequency_peak
+        ),
+        "timing_quality_status": timing_status,
+    }
+
+
+def _should_save_package(output_profile: str, quality_status: str) -> bool:
+    if output_profile == "full":
+        return True
+    if output_profile == "accepted":
+        return quality_status == "accepted"
+    if output_profile == "summary":
+        return False
+    raise ValueError(f"unknown output profile: {output_profile}")
+
+
+def summarize_murmur_observations(summary: pd.DataFrame) -> pd.DataFrame:
+    """Describe accepted Present candidates without promoting them to ground truth."""
+
+    base_columns = [
+        "timing_label",
+        "activity_detection_method",
+        "segment_count",
+    ]
+    if summary.empty:
+        return pd.DataFrame(columns=base_columns)
+    required = {"murmur_label", "candidate_quality_status"}
+    if not required.issubset(summary.columns):
+        return pd.DataFrame(columns=base_columns)
+    selected = summary[
+        summary["murmur_label"].eq("Present")
+        & summary["candidate_quality_status"].eq("accepted")
+    ].copy()
+    available_metrics = [name for name in OBSERVATION_METRICS if name in selected]
+    if selected.empty or not available_metrics:
+        return pd.DataFrame(columns=base_columns)
+    group_columns = ["timing_label", "activity_detection_method"]
+    grouped = selected.groupby(group_columns, dropna=False, sort=True)
+    result = grouped.size().rename("segment_count").to_frame()
+    for metric in available_metrics:
+        result[f"{metric}_mean"] = grouped[metric].mean()
+        result[f"{metric}_median"] = grouped[metric].median()
+    return result.reset_index()
+
+
+def _write_checkpoint(rows: list[dict[str, Any]], destination: Path) -> None:
+    """Atomically persist completed segments so a long run can safely resume."""
+
+    if not rows:
+        return
+    temporary = destination.with_suffix(".tmp")
+    pd.DataFrame(rows).to_csv(temporary, index=False)
+    temporary.replace(destination)
+
+
 def _write_diagnostic_plot(
     result: SeparationResult,
     destination: Path,
@@ -214,6 +423,23 @@ def _write_diagnostic_plot(
     metadata: dict[str, Any],
 ) -> None:
     time = np.arange(len(result.original)) / sample_rate
+    onset_seconds = result.metrics.get("murmur_onset_cycle_seconds")
+    offset_seconds = result.metrics.get("murmur_offset_cycle_seconds")
+    if onset_seconds is not None and offset_seconds is not None:
+        observation_start = max(0, int(round(float(onset_seconds) * sample_rate)))
+        observation_end = min(
+            len(result.murmur_candidate),
+            int(round(float(offset_seconds) * sample_rate)),
+        )
+    else:
+        observation_start = 0
+        observation_end = len(result.murmur_candidate)
+    if observation_end <= observation_start:
+        observation_start = 0
+        observation_end = len(result.murmur_candidate)
+    observation_candidate = result.murmur_candidate[
+        observation_start:observation_end
+    ]
     figure, axes = plt.subplots(5, 2, figsize=(15, 18))
     axes = axes.ravel()
     axes[0].plot(time, result.original, linewidth=0.7)
@@ -239,16 +465,43 @@ def _write_diagnostic_plot(
     axes[4].set_title("Noise/artifact candidate")
     axes[5].plot(time, np.abs(hilbert(result.murmur_candidate)), linewidth=0.7)
     axes[5].set_title("Murmur-candidate amplitude envelope")
-    axes[6].psd(result.murmur_candidate, Fs=sample_rate, NFFT=min(256, len(time)))
-    axes[6].set_title("Murmur-candidate PSD")
-    frequencies, times, power = spectrogram(
-        result.murmur_candidate,
-        fs=sample_rate,
-        nperseg=min(128, len(result.murmur_candidate)),
+    if onset_seconds is not None and offset_seconds is not None:
+        for axis in (axes[3], axes[5]):
+            axis.axvline(float(onset_seconds), color="tab:red", linestyle="--")
+            axis.axvline(float(offset_seconds), color="tab:red", linestyle="--")
+    axes[6].psd(
+        observation_candidate,
+        Fs=sample_rate,
+        NFFT=min(256, len(observation_candidate)),
     )
-    axes[7].pcolormesh(times, frequencies, 10 * np.log10(power + 1e-12), shading="auto")
+    axes[6].set_title("Detected murmur-candidate interval PSD")
+    frequencies, times, power = spectrogram(
+        observation_candidate,
+        fs=sample_rate,
+        nperseg=min(128, len(observation_candidate)),
+    )
+    times = times + observation_start / sample_rate
+    power_db = 10 * np.log10(power + 1e-12)
+    if power.shape[1] == 1:
+        half_width = max(
+            len(observation_candidate) / sample_rate / 2,
+            1 / sample_rate,
+        )
+        axes[7].imshow(
+            power_db,
+            origin="lower",
+            aspect="auto",
+            extent=(
+                times[0] - half_width,
+                times[0] + half_width,
+                frequencies[0],
+                frequencies[-1],
+            ),
+        )
+    else:
+        axes[7].pcolormesh(times, frequencies, power_db, shading="auto")
     axes[7].set_ylim(0, min(1000, sample_rate / 2))
-    axes[7].set_title("Murmur-candidate spectrogram")
+    axes[7].set_title("Detected murmur-candidate interval spectrogram")
     assignments = result.assignments
     axes[8].bar(
         [row["component_index"] for row in result.component_features],
@@ -284,6 +537,9 @@ def _write_diagnostic_plot(
             "phase_rejected_component_count",
             "phase_selection_used_fallback",
             "candidate_quality_status",
+            "timing_quality_status",
+            "murmur_onset_recording_seconds",
+            "murmur_offset_recording_seconds",
         }
     ]
     def preview(indexes: list[int]) -> str:
@@ -419,34 +675,108 @@ def run_audit(
     method: str = "auto",
     validate_first: bool = True,
     run_name: str | None = None,
+    all_recordings: bool = False,
+    output_profile: str = "full",
+    resume: bool = False,
 ) -> pd.DataFrame:
+    if limit < 0:
+        raise ValueError("limit must be non-negative; use 0 for no limit")
+    if cycles_per_recording < 0:
+        raise ValueError(
+            "cycles_per_recording must be non-negative; use 0 for all cycles"
+        )
+    if output_profile not in {"full", "accepted", "summary"}:
+        raise ValueError("output_profile must be full, accepted, or summary")
+    if resume and not run_name:
+        raise ValueError("resume requires a run_name to identify its checkpoint")
     ensure_output_directories()
     if validate_first:
         validate_dataset()
     metadata_table = pd.read_csv(METADATA_PATH, dtype={"Patient ID": str})
-    recordings = _representative_recordings(metadata_table, limit)
+    recordings = (
+        _all_recordings(metadata_table, limit)
+        if all_recordings
+        else _representative_recordings(metadata_table, limit)
+    )
+    suffix = f"_{run_name}" if run_name else ""
+    checkpoint_path = REPORT_OUTPUT_DIR / f"separation_checkpoint{suffix}.csv"
     summary_rows: list[dict[str, Any]] = []
-    for recording in recordings:
+    if resume and checkpoint_path.exists():
+        checkpoint = pd.read_csv(
+            checkpoint_path,
+            dtype={
+                "recording_id": str,
+                "config_hash": str,
+                "requested_method": str,
+                "recording_scope": str,
+                "output_profile": str,
+            },
+        )
+        if "config_hash" in checkpoint and not checkpoint.empty:
+            hashes = set(checkpoint["config_hash"].dropna().astype(str))
+            if hashes != {config.config_hash}:
+                raise ValueError(
+                    "checkpoint configuration does not match the requested run"
+                )
+        expected_identity = {
+            "requested_method": method,
+            "recording_scope": "all" if all_recordings else "representative",
+            "output_profile": output_profile,
+        }
+        if not checkpoint.empty:
+            missing_identity = set(expected_identity) - set(checkpoint.columns)
+            if missing_identity:
+                raise ValueError(
+                    "checkpoint is missing run identity fields; choose a new run_name"
+                )
+            for column, expected in expected_identity.items():
+                observed = set(checkpoint[column].dropna().astype(str))
+                if observed != {str(expected)}:
+                    raise ValueError(
+                        f"checkpoint {column} does not match the requested run"
+                    )
+        summary_rows = checkpoint.to_dict(orient="records")
+    completed = {
+        (str(row["recording_id"]), int(row["cycle_index"]))
+        for row in summary_rows
+        if "recording_id" in row and "cycle_index" in row
+    }
+    skipped_rows: list[dict[str, Any]] = []
+    output_root = (
+        SEPARATION_OUTPUT_DIR / run_name if run_name else SEPARATION_OUTPUT_DIR
+    )
+    for recording_number, recording in enumerate(recordings, start=1):
         recording_id = recording["recording_id"]
-        signal, sample_rate = _load_wav(
-            AUDIO_DIR / f"{recording_id}.wav", config.sample_rate
-        )
-        annotations = pd.read_csv(
-            AUDIO_DIR / f"{recording_id}.tsv",
-            sep="\t",
-            header=None,
-            names=["start", "end", "state"],
-        )
-        systole_positions = np.flatnonzero(annotations["state"].to_numpy() == 2)[
-            :cycles_per_recording
-        ]
+        try:
+            signal, sample_rate = _load_wav(
+                AUDIO_DIR / f"{recording_id}.wav", config.sample_rate
+            )
+            annotations = pd.read_csv(
+                AUDIO_DIR / f"{recording_id}.tsv",
+                sep="\t",
+                header=None,
+                names=["start", "end", "state"],
+            )
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            message = f"recording load failed: {exc}"
+            print(f"Skipping {recording_id}: {message}")
+            skipped_rows.append({**recording, "cycle_index": None, "reason": message})
+            continue
+        systole_positions = np.flatnonzero(annotations["state"].to_numpy() == 2)
+        if cycles_per_recording > 0:
+            systole_positions = systole_positions[:cycles_per_recording]
         for cycle_index, systole_position in enumerate(systole_positions):
+            if (recording_id, cycle_index) in completed:
+                continue
             try:
                 cycle = build_cardiac_cycle_context(
                     signal, annotations, int(systole_position), sample_rate
                 )
             except ValueError as exc:
                 print(f"Skipping {recording_id} cycle {cycle_index}: {exc}")
+                skipped_rows.append(
+                    {**recording, "cycle_index": cycle_index, "reason": str(exc)}
+                )
                 continue
             if method == "auto":
                 result, _ = compare_separation_methods(
@@ -472,6 +802,9 @@ def run_audit(
                     phase_masks=cycle.phase_masks,
                 )
             )
+            result.metrics.update(
+                _absolute_timing_metrics(result.metrics, cycle, sample_rate)
+            )
             segment_metadata: dict[str, Any] = {
                 **recording,
                 "cycle_index": cycle_index,
@@ -479,6 +812,11 @@ def run_audit(
                 "context_start_sample": cycle.context_start_sample,
                 "context_end_sample": cycle.context_end_sample,
                 "sample_rate": sample_rate,
+                "config_hash": config.config_hash,
+                "requested_method": method,
+                "separation_method": result.selected_method,
+                "recording_scope": "all" if all_recordings else "representative",
+                "output_profile": output_profile,
             }
             for phase, (relative_start, relative_end) in cycle.phase_bounds.items():
                 segment_metadata[f"{phase}_relative_start_sample"] = relative_start
@@ -493,30 +831,42 @@ def run_audit(
                 str(recording["murmur_label"]),
                 str(result.metrics["candidate_quality_status"]),
             )
-            output_root = (
-                SEPARATION_OUTPUT_DIR / run_name
-                if run_name
-                else SEPARATION_OUTPUT_DIR
-            )
             directory = (
                 output_root
                 / recording_id
                 / f"cycle_{cycle_index}_context"
             )
-            summary_rows.append(
-                _save_segment_package(result, directory, segment_metadata, config)
+            quality_status = str(result.metrics["candidate_quality_status"])
+            save_package = _should_save_package(output_profile, quality_status)
+            if save_package:
+                metrics = _save_segment_package(
+                    result, directory, segment_metadata, config
+                )
+            else:
+                metrics = {**segment_metadata, **result.metrics}
+            metrics["package_saved"] = save_package
+            summary_rows.append(metrics)
+            completed.add((recording_id, cycle_index))
+        _write_checkpoint(summary_rows, checkpoint_path)
+        if recording_number % 25 == 0 or recording_number == len(recordings):
+            print(
+                f"Completed recordings: {recording_number}/{len(recordings)}; "
+                f"segments: {len(summary_rows)}"
             )
     summary = pd.DataFrame(summary_rows)
-    suffix = f"_{run_name}" if run_name else ""
     destination = REPORT_OUTPUT_DIR / f"separation_summary{suffix}.csv"
     summary.to_csv(destination, index=False)
-    accepted = summary[
-        summary.get("candidate_quality_status", pd.Series(dtype=str)).eq("accepted")
-    ]
+    if "candidate_quality_status" in summary:
+        accepted = summary[summary["candidate_quality_status"].eq("accepted")]
+    else:
+        accepted = summary.copy()
     accepted.to_csv(
         REPORT_OUTPUT_DIR / f"separation_summary{suffix}_accepted.csv", index=False
     )
-    present_accepted = accepted[accepted.get("murmur_label", "").eq("Present")]
+    if "murmur_label" in accepted:
+        present_accepted = accepted[accepted["murmur_label"].eq("Present")]
+    else:
+        present_accepted = accepted.copy()
     present_accepted.to_csv(
         REPORT_OUTPUT_DIR
         / f"separation_summary{suffix}_present_accepted.csv",
@@ -525,8 +875,55 @@ def run_audit(
     summarize_audit_quality(summary).to_csv(
         REPORT_OUTPUT_DIR / f"separation_quality{suffix}.csv", index=False
     )
+    observation_columns = [
+        "patient_id",
+        "recording_id",
+        "location",
+        "cycle_index",
+        "timing_label",
+        "candidate_quality_status",
+        "timing_quality_status",
+        "activity_detection_method",
+        *OBSERVATION_METRICS,
+    ]
+    observation_columns = [
+        column for column in observation_columns if column in present_accepted
+    ]
+    present_accepted[observation_columns].to_csv(
+        REPORT_OUTPUT_DIR / f"murmur_observations{suffix}.csv", index=False
+    )
+    summarize_murmur_observations(summary).to_csv(
+        REPORT_OUTPUT_DIR / f"murmur_observation_summary{suffix}.csv", index=False
+    )
+    skipped = pd.DataFrame(skipped_rows)
+    if skipped.empty:
+        skipped = pd.DataFrame(
+            columns=["patient_id", "recording_id", "cycle_index", "reason"]
+        )
+    skipped.to_csv(
+        REPORT_OUTPUT_DIR / f"separation_skipped{suffix}.csv", index=False
+    )
     (REPORT_OUTPUT_DIR / f"separation_config{suffix}.json").write_text(
         json.dumps(config.to_dict(), indent=2), encoding="utf-8"
+    )
+    manifest = {
+        "run_name": run_name,
+        "all_recordings": all_recordings,
+        "recording_limit": limit,
+        "cycles_per_recording": cycles_per_recording,
+        "method": method,
+        "output_profile": output_profile,
+        "resume": resume,
+        "selected_recordings": len(recordings),
+        "processed_segments": len(summary),
+        "skipped_segments_or_recordings": len(skipped_rows),
+        "config_hash": config.config_hash,
+        "candidate_interpretation": (
+            "Estimated murmur candidate; not clean-source ground truth"
+        ),
+    }
+    (REPORT_OUTPUT_DIR / f"separation_manifest{suffix}.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
     )
     return summary
 
@@ -535,6 +932,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--cycles-per-recording", type=int, default=1)
+    parser.add_argument(
+        "--all-recordings",
+        action="store_true",
+        help="Enumerate exact WAV/TSV pairs instead of one recording per patient",
+    )
+    parser.add_argument(
+        "--output-profile",
+        choices=["full", "accepted", "summary"],
+        default="full",
+        help="Choose which per-cycle artifact packages are written",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume completed recording/cycle pairs from the run checkpoint",
+    )
     parser.add_argument("--method", choices=["auto", "zcr", "kurtosis"], default="auto")
     parser.add_argument("--energy-threshold", type=float, default=0.99)
     parser.add_argument(
@@ -578,6 +991,9 @@ def main(argv: list[str] | None = None) -> int:
         method=args.method,
         validate_first=not args.skip_dataset_validation,
         run_name=args.run_name,
+        all_recordings=args.all_recordings,
+        output_profile=args.output_profile,
+        resume=args.resume,
     )
     print(f"Processed segments: {len(summary)}")
     if "candidate_quality_status" in summary:
@@ -594,6 +1010,14 @@ def main(argv: list[str] | None = None) -> int:
         f"{REPORT_OUTPUT_DIR / f'separation_summary{suffix}_present_accepted.csv'}"
     )
     print(f"Quality report: {REPORT_OUTPUT_DIR / f'separation_quality{suffix}.csv'}")
+    print(
+        "Murmur observations: "
+        f"{REPORT_OUTPUT_DIR / f'murmur_observations{suffix}.csv'}"
+    )
+    print(
+        "Observation summary: "
+        f"{REPORT_OUTPUT_DIR / f'murmur_observation_summary{suffix}.csv'}"
+    )
     return 0
 
 

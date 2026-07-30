@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import hilbert
+from scipy.signal import hilbert, spectrogram, welch
 
 
 EPSILON = 1e-12
@@ -43,6 +43,112 @@ def spectral_features(signal: np.ndarray, sample_rate: int) -> dict[str, float]:
         "spectral_bandwidth": bandwidth,
         "spectral_entropy": entropy / max_entropy,
         "dominant_frequency": float(frequencies[int(np.argmax(power))]),
+    }
+
+
+def murmur_observation_features(
+    signal: np.ndarray, sample_rate: int
+) -> dict[str, float]:
+    """Return compact amplitude, PSD, and time-frequency murmur descriptors."""
+
+    values = np.asarray(signal, dtype=float)
+    empty = (
+        values.size == 0
+        or not np.all(np.isfinite(values))
+        or energy(values) <= EPSILON
+    )
+    if empty:
+        return {
+            "amplitude_peak_abs": 0.0,
+            "amplitude_rms": 0.0,
+            "amplitude_mean_abs": 0.0,
+            "amplitude_envelope_peak": 0.0,
+            "amplitude_envelope_mean": 0.0,
+            "amplitude_crest_factor": 0.0,
+            "psd_peak_frequency_hz": 0.0,
+            "psd_peak_power": 0.0,
+            "psd_frequency_resolution_hz": 0.0,
+            "psd_0_100_hz_ratio": 0.0,
+            "psd_100_200_hz_ratio": 0.0,
+            "psd_200_400_hz_ratio": 0.0,
+            "psd_400_800_hz_ratio": 0.0,
+            "psd_800_1000_hz_ratio": 0.0,
+            "psd_above_1000_hz_ratio": 0.0,
+            "time_frequency_peak_hz": 0.0,
+            "time_frequency_peak_seconds": 0.0,
+            "time_frequency_frame_count": 0.0,
+            "time_frequency_frequency_resolution_hz": 0.0,
+            "time_frequency_window_seconds": 0.0,
+            "time_frequency_entropy": 0.0,
+            "time_frequency_spectral_flux": 0.0,
+        }
+
+    envelope = np.abs(hilbert(values)) if len(values) > 2 else np.abs(values)
+    peak = float(np.max(np.abs(values)))
+    rms = float(np.sqrt(np.mean(values**2)))
+
+    psd_frequencies, psd = welch(
+        values,
+        fs=sample_rate,
+        nperseg=min(256, len(values)),
+        detrend="constant",
+    )
+    psd_total = float(np.sum(psd)) + EPSILON
+
+    def band_ratio(low: float, high: float | None) -> float:
+        mask = psd_frequencies >= low
+        if high is not None:
+            mask &= psd_frequencies < high
+        return float(np.sum(psd[mask]) / psd_total)
+
+    nperseg = min(128, len(values))
+    tf_frequencies, tf_times, tf_power = spectrogram(
+        values,
+        fs=sample_rate,
+        nperseg=nperseg,
+        noverlap=nperseg // 2,
+        detrend="constant",
+    )
+    peak_frequency = 0.0
+    peak_seconds = 0.0
+    tf_entropy = 0.0
+    spectral_flux = 0.0
+    if tf_power.size:
+        peak_index = np.unravel_index(int(np.argmax(tf_power)), tf_power.shape)
+        peak_frequency = float(tf_frequencies[peak_index[0]])
+        peak_seconds = float(tf_times[peak_index[1]])
+        normalized_tf = tf_power / (float(np.sum(tf_power)) + EPSILON)
+        entropy = -float(np.sum(normalized_tf * np.log2(normalized_tf + EPSILON)))
+        tf_entropy = entropy / np.log2(max(2, normalized_tf.size))
+        if tf_power.shape[1] > 1:
+            frame_power = tf_power / (np.sum(tf_power, axis=0, keepdims=True) + EPSILON)
+            spectral_flux = float(
+                np.mean(np.sqrt(np.sum(np.diff(frame_power, axis=1) ** 2, axis=0)))
+            )
+
+    return {
+        "amplitude_peak_abs": peak,
+        "amplitude_rms": rms,
+        "amplitude_mean_abs": float(np.mean(np.abs(values))),
+        "amplitude_envelope_peak": float(np.max(envelope)),
+        "amplitude_envelope_mean": float(np.mean(envelope)),
+        "amplitude_crest_factor": peak / (rms + EPSILON),
+        "psd_peak_frequency_hz": float(psd_frequencies[int(np.argmax(psd))]),
+        "psd_peak_power": float(np.max(psd)),
+        "psd_frequency_resolution_hz": float(sample_rate / min(256, len(values))),
+        "psd_0_100_hz_ratio": band_ratio(0, 100),
+        "psd_100_200_hz_ratio": band_ratio(100, 200),
+        "psd_200_400_hz_ratio": band_ratio(200, 400),
+        "psd_400_800_hz_ratio": band_ratio(400, 800),
+        "psd_800_1000_hz_ratio": band_ratio(800, 1000),
+        "psd_above_1000_hz_ratio": band_ratio(1000, None),
+        "time_frequency_peak_hz": peak_frequency,
+        "time_frequency_peak_seconds": peak_seconds,
+        "time_frequency_frame_count": float(tf_power.shape[1]),
+        "time_frequency_frequency_resolution_hz": float(sample_rate / nperseg),
+        "time_frequency_window_seconds": float(nperseg / sample_rate),
+        "time_frequency_entropy": float(tf_entropy),
+        "time_frequency_spectral_flux": spectral_flux,
     }
 
 
@@ -115,6 +221,12 @@ def detect_activity_interval(
     positions = np.arange(len(values), dtype=float) / max(1, len(values) - 1)
     total = float(phase_energy.sum())
     return {
+        "onset_sample": int(start),
+        "offset_sample": int(end),
+        "duration_samples": int(end - start),
+        "onset_seconds": start / sample_rate,
+        "offset_seconds": end / sample_rate,
+        "duration_seconds": (end - start) / sample_rate,
         "onset_normalized": start / len(values),
         "offset_normalized": end / len(values),
         "duration_ratio": (end - start) / len(values),
@@ -129,6 +241,12 @@ def detect_activity_interval(
 
 def _empty_activity() -> dict[str, float | str | None]:
     return {
+        "onset_sample": None,
+        "offset_sample": None,
+        "duration_samples": None,
+        "onset_seconds": None,
+        "offset_seconds": None,
+        "duration_seconds": None,
         "onset_normalized": None,
         "offset_normalized": None,
         "duration_ratio": None,
@@ -196,7 +314,6 @@ def real_proxy_metrics(
         outside_murmur_energy_ratio = energy(candidate_values[~systole_mask]) / (
             energy(candidate_values) + EPSILON
         )
-    spectral = spectral_features(timing_candidate, sample_rate)
     timing = detect_activity_interval(
         timing_candidate,
         sample_rate,
@@ -204,6 +321,14 @@ def real_proxy_metrics(
         minimum_duration_ms=minimum_duration_ms,
         merge_gap_ms=merge_gap_ms,
     )
+    spectral = spectral_features(timing_candidate, sample_rate)
+    onset = timing["onset_sample"]
+    offset = timing["offset_sample"]
+    if onset is not None and offset is not None and int(offset) > int(onset):
+        observation_candidate = timing_candidate[int(onset) : int(offset)]
+    else:
+        observation_candidate = timing_candidate
+    observation = murmur_observation_features(observation_candidate, sample_rate)
     return {
         "reconstruction_error": reconstruction_error,
         "normal_residual_correlation": safe_correlation(normal, murmur_candidate),
@@ -215,6 +340,8 @@ def real_proxy_metrics(
         "residual_spectral_centroid": spectral["spectral_centroid"],
         "residual_bandwidth": spectral["spectral_bandwidth"],
         "residual_spectral_entropy": spectral["spectral_entropy"],
+        "residual_dominant_frequency": spectral["dominant_frequency"],
+        **observation,
         **timing,
     }
 

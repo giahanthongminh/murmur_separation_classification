@@ -56,6 +56,30 @@ Use `--disable-phase-aware-selection` for a baseline ablation, or adjust
 threshold studies. `--disable-phase-selection-fallback` exposes cases where no
 provisional component satisfies the phase criteria.
 
+For a restartable scan of every exact WAV/TSV pair, first run a small pilot and
+then expand the same configuration:
+
+```bash
+python -m src.separation.audit --all-recordings --limit 20 --cycles-per-recording 3 --method auto --use-dwt --output-profile summary --run-name cssa_auto_dwt_all_recordings_pilot --skip-dataset-validation
+python -m src.separation.audit --all-recordings --limit 0 --cycles-per-recording 3 --method auto --use-dwt --output-profile summary --run-name cssa_auto_dwt_all_recordings --resume --skip-dataset-validation
+```
+
+`--limit 0` means all recordings and `--cycles-per-recording 0` means all valid
+cycles. The `summary` profile avoids tens of thousands of per-cycle audio and
+plot files. A checkpoint is written after every recording, and `--resume`
+skips completed recording/cycle pairs while rejecting a checkpoint created by
+a different method, output profile, scope, or separation configuration.
+
+The audit exports `murmur_observations_<run>.csv` only from location-aware
+`Present` recordings whose candidates pass the quality gate. It includes
+normalized and absolute onset/offset, amplitude envelope and RMS statistics,
+dominant frequency and spectral shape, PSD band-energy ratios, and
+time-frequency peak/entropy/flux. The grouped means and medians are written to
+`murmur_observation_summary_<run>.csv`. These describe an estimated murmur
+candidate, not clean-source ground truth. Amplitude is relative to each WAV's
+digital full scale and should not be interpreted as calibrated sound pressure
+or compared clinically across recording devices.
+
 Phase-aware candidates are tuned by the full-cycle synthetic ground-truth grid
 rather than the real audit set. Run
 `python -m src.evaluation.synthetic_benchmark --tune-phase-thresholds` to
