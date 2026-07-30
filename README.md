@@ -41,6 +41,18 @@ energy in that phase. Outside-murmur energy is candidate energy outside the
 annotated systole divided by total candidate energy. Use `--run-name` to keep
 method outputs and reports isolated during direct comparisons.
 
+When cardiac phase masks are available, provisional murmur components are
+filtered by phase-energy density. Components must have sufficient systolic
+focus and systole-to-S1/S2 contrast; rejected full-length components return to
+the normal-heart estimate, so reconstruction remains exact and leakage is not
+hidden by zeroing samples outside systole. If no component passes, the most
+systole-focused provisional component is retained and
+`phase_selection_used_fallback` is recorded for low-confidence review.
+Use `--disable-phase-aware-selection` for a baseline ablation, or adjust
+`--minimum-systole-focus` and `--minimum-systole-to-s1-s2-ratio` in explicit
+threshold studies. `--disable-phase-selection-fallback` exposes cases where no
+provisional component satisfies the phase criteria.
+
 ## Synthetic ground truth
 
 ```bash

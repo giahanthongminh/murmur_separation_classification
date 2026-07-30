@@ -6,7 +6,11 @@ import pandas as pd
 import pytest
 
 from config import SeparationConfig, validate_input_output_isolation
-from src.separation.core import separate_signal
+from src.separation.core import (
+    _phase_aware_murmur_indexes,
+    _phase_energy_features,
+    separate_signal,
+)
 from src.separation.audit import build_cardiac_cycle_context
 from src.separation.metrics import detect_activity_interval, real_proxy_metrics
 from src.ssa import select_component_count, ssa_decompose_audited
@@ -65,6 +69,106 @@ def test_three_way_outputs_reconstruct_input() -> None:
     np.testing.assert_allclose(reconstructed, result.original, atol=1e-10)
     assigned = sum(result.assignments.values(), [])
     assert sorted(assigned) == list(range(len(result.component_features)))
+
+
+def test_phase_selection_rejects_s1_s2_dominated_components() -> None:
+    rows = [
+        {
+            "systole_focus_score": 0.70,
+            "systole_to_s1_s2_ratio": 2.0,
+            "relative_energy": 0.10,
+        },
+        {
+            "systole_focus_score": 0.08,
+            "systole_to_s1_s2_ratio": 0.05,
+            "relative_energy": 0.20,
+        },
+        {
+            "systole_focus_score": 0.20,
+            "systole_to_s1_s2_ratio": 0.10,
+            "relative_energy": 0.15,
+        },
+    ]
+    config = SeparationConfig(phase_selection_fallback=False)
+    selected, rejected, used_fallback = _phase_aware_murmur_indexes(
+        rows, [0, 1, 2], config
+    )
+    assert selected == [0]
+    assert rejected == [1, 2]
+    assert not used_fallback
+
+
+def test_phase_energy_features_use_density_not_phase_duration() -> None:
+    lengths = {"s1": 10, "systole": 20, "s2": 10, "diastole": 40}
+    amplitudes = {"s1": 2.0, "systole": 4.0, "s2": 1.0, "diastole": 0.5}
+    component_parts = []
+    masks: dict[str, np.ndarray] = {}
+    offset = 0
+    total_length = sum(lengths.values())
+    for phase in ("s1", "systole", "s2", "diastole"):
+        component_parts.append(np.full(lengths[phase], amplitudes[phase]))
+        mask = np.zeros(total_length, dtype=bool)
+        mask[offset : offset + lengths[phase]] = True
+        masks[phase] = mask
+        offset += lengths[phase]
+    features = _phase_energy_features(np.concatenate(component_parts), masks)
+    expected_density_total = 2.0**2 + 4.0**2 + 1.0**2 + 0.5**2
+    assert features["systole_focus_score"] == pytest.approx(
+        4.0**2 / expected_density_total
+    )
+    assert features["systole_to_s1_s2_ratio"] == pytest.approx(
+        4.0**2 / (2.0**2 + 1.0**2)
+    )
+
+
+def test_phase_selection_fallback_retains_best_systolic_component() -> None:
+    rows = [
+        {
+            "systole_focus_score": 0.02,
+            "systole_to_s1_s2_ratio": 0.01,
+            "relative_energy": 0.30,
+        },
+        {
+            "systole_focus_score": 0.08,
+            "systole_to_s1_s2_ratio": 0.10,
+            "relative_energy": 0.05,
+        },
+    ]
+    selected, rejected, used_fallback = _phase_aware_murmur_indexes(
+        rows, [0, 1], SeparationConfig()
+    )
+    assert selected == [1]
+    assert rejected == [0]
+    assert used_fallback
+
+
+def test_phase_aware_outputs_preserve_full_cycle_reconstruction() -> None:
+    signal = _signal()
+    phase_masks: dict[str, np.ndarray] = {}
+    phase_length = len(signal) // 4
+    for index, phase in enumerate(("s1", "systole", "s2", "diastole")):
+        mask = np.zeros(len(signal), dtype=bool)
+        mask[index * phase_length : (index + 1) * phase_length] = True
+        phase_masks[phase] = mask
+    result = separate_signal(
+        signal,
+        config=SeparationConfig(sample_rate=400, ssa_window_length=40),
+        method="zcr",
+        phase_masks=phase_masks,
+    )
+    reconstructed = (
+        result.normal_estimate + result.murmur_candidate + result.noise_candidate
+    )
+    np.testing.assert_allclose(reconstructed, signal, atol=1e-10)
+    assert result.metrics["phase_aware_selection_applied"]
+    assert result.metrics["onset_normalized"] is not None
+    assert result.metrics["offset_normalized"] is not None
+    assert all(
+        "systole_focus_score" in row
+        and "systole_to_s1_s2_ratio" in row
+        and "base_assignment" in row
+        for row in result.component_features
+    )
 
 
 @pytest.mark.parametrize("duration_ms", [70, 100, 200])
