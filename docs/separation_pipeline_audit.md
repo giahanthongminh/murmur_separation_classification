@@ -82,4 +82,4 @@ The refactor preserves the historical functions where practical while adding:
 
 Legacy classifier experiments are retained. Their paths are redirected to project outputs; they are not used to decide whether separation is valid.
 
-Because isolation is performed on a systolic-only segment, complete S1 and S2 intervals are outside that segment. The minimum metrics schema therefore exports `s1_leakage_ratio` and `s2_leakage_ratio` as unavailable rather than falsely reporting zero. A future full-cycle evaluator should estimate those metrics from adjacent annotated states without concatenating cardiac phases before SSA.
+The repaired real-data audit processes each contiguous S1-systole-S2-diastole cycle without concatenating disjoint intervals. Timing is detected and normalized only within the systolic mask. `s1_leakage_ratio` and `s2_leakage_ratio` measure candidate energy in each heart-sound phase relative to original phase energy, while `outside_murmur_energy_ratio` measures the fraction of total candidate energy outside the annotated systole. This supplies full-cycle leakage context while retaining cycle identity.

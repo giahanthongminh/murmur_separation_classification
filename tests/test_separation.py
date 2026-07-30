@@ -2,10 +2,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from config import SeparationConfig, validate_input_output_isolation
 from src.separation.core import separate_signal
+from src.separation.audit import build_cardiac_cycle_context
+from src.separation.metrics import detect_activity_interval, real_proxy_metrics
 from src.ssa import select_component_count, ssa_decompose_audited
 
 
@@ -62,3 +65,86 @@ def test_three_way_outputs_reconstruct_input() -> None:
     np.testing.assert_allclose(reconstructed, result.original, atol=1e-10)
     assigned = sum(result.assignments.values(), [])
     assert sorted(assigned) == list(range(len(result.component_features)))
+
+
+@pytest.mark.parametrize("duration_ms", [70, 100, 200])
+def test_valid_short_candidates_have_finite_timing(duration_ms: int) -> None:
+    """Valid 70--200 ms candidates must not export all-NaN timing fields."""
+
+    sample_rate = 4000
+    samples = int(sample_rate * duration_ms / 1000)
+    time = np.arange(samples) / sample_rate
+    envelope = np.sin(np.pi * np.arange(samples) / max(1, samples - 1)) ** 2
+    candidate = envelope * np.sin(2 * np.pi * 180 * time)
+    timing = detect_activity_interval(candidate, sample_rate)
+    timing_values = [
+        timing["onset_normalized"],
+        timing["offset_normalized"],
+        timing["duration_ratio"],
+        timing["temporal_energy_centroid"],
+        timing["peak_position"],
+    ]
+    assert all(value is not None and np.isfinite(value) for value in timing_values)
+    assert 0 <= timing["onset_normalized"] < timing["offset_normalized"] <= 1
+
+
+def test_full_cycle_proxy_metrics_compute_phase_leakage() -> None:
+    samples_per_phase = 100
+    length = 4 * samples_per_phase
+    original = np.ones(length)
+    candidate = np.concatenate(
+        [
+            np.full(samples_per_phase, 0.5),
+            np.full(samples_per_phase, 0.25),
+            np.full(samples_per_phase, 0.2),
+            np.full(samples_per_phase, 0.1),
+        ]
+    )
+    masks = {}
+    for index, phase in enumerate(("s1", "systole", "s2", "diastole")):
+        mask = np.zeros(length, dtype=bool)
+        mask[index * samples_per_phase : (index + 1) * samples_per_phase] = True
+        masks[phase] = mask
+    metrics = real_proxy_metrics(
+        original,
+        original - candidate,
+        candidate,
+        np.zeros(length),
+        4000,
+        phase_masks=masks,
+    )
+    assert metrics["s1_leakage_ratio"] == pytest.approx(0.25)
+    assert metrics["s2_leakage_ratio"] == pytest.approx(0.04)
+    assert metrics["murmur_region_energy_retention"] == pytest.approx(0.0625)
+    expected_outside = (0.5**2 + 0.2**2 + 0.1**2) / (
+        0.5**2 + 0.25**2 + 0.2**2 + 0.1**2
+    )
+    assert metrics["outside_murmur_energy_ratio"] == pytest.approx(expected_outside)
+    assert metrics["onset_normalized"] is not None
+    assert metrics["offset_normalized"] is not None
+
+
+def test_cycle_context_contains_all_four_phases() -> None:
+    sample_rate = 1000
+    signal = np.arange(600, dtype=float)
+    annotations = pd.DataFrame(
+        [
+            (0.0, 0.1, 0),
+            (0.1, 0.2, 1),
+            (0.2, 0.3, 2),
+            (0.3, 0.4, 3),
+            (0.4, 0.6, 4),
+        ],
+        columns=["start", "end", "state"],
+    )
+    context = build_cardiac_cycle_context(signal, annotations, 2, sample_rate)
+    assert context.context_start_sample == 100
+    assert context.context_end_sample == 600
+    assert len(context.signal) == 500
+    assert context.phase_bounds == {
+        "s1": (0, 100),
+        "systole": (100, 200),
+        "s2": (200, 300),
+        "diastole": (300, 500),
+    }
+    assert all(mask.any() for mask in context.phase_masks.values())

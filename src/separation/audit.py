@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,18 @@ from src.separation.core import (
     compare_separation_methods,
     separate_signal,
 )
+from src.separation.metrics import real_proxy_metrics
+
+
+@dataclass(frozen=True)
+class CardiacCycleContext:
+    """One contiguous S1-systole-S2-diastole cycle and its phase masks."""
+
+    signal: np.ndarray
+    phase_masks: dict[str, np.ndarray]
+    phase_bounds: dict[str, tuple[int, int]]
+    context_start_sample: int
+    context_end_sample: int
 
 
 def _json_value(value: Any) -> Any:
@@ -61,6 +73,69 @@ def _load_wav(path: Path, target_rate: int) -> tuple[np.ndarray, int]:
         values = resample_poly(values, target_rate // common, sample_rate // common)
         sample_rate = target_rate
     return values, sample_rate
+
+
+def _annotation_sample_bounds(
+    annotation: pd.Series, sample_rate: int, signal_length: int
+) -> tuple[int, int]:
+    start = int(round(float(annotation["start"]) * sample_rate))
+    end = int(round(float(annotation["end"]) * sample_rate))
+    return max(0, min(start, signal_length)), max(0, min(end, signal_length))
+
+
+def build_cardiac_cycle_context(
+    signal: np.ndarray,
+    annotations: pd.DataFrame,
+    systole_position: int,
+    sample_rate: int,
+) -> CardiacCycleContext:
+    """Extract a contiguous S1-systole-S2-diastole context around one systole."""
+
+    table = annotations.reset_index(drop=True)
+    required_positions = {
+        "s1": systole_position - 1,
+        "systole": systole_position,
+        "s2": systole_position + 1,
+        "diastole": systole_position + 2,
+    }
+    expected_states = {"s1": 1, "systole": 2, "s2": 3, "diastole": 4}
+    for phase, position in required_positions.items():
+        if not 0 <= position < len(table):
+            raise ValueError(f"incomplete cardiac-cycle context: missing {phase}")
+        state = int(table.iloc[position]["state"])
+        if state != expected_states[phase]:
+            raise ValueError(
+                f"invalid cardiac-cycle sequence at {phase}: expected "
+                f"{expected_states[phase]}, found {state}"
+            )
+
+    absolute_bounds = {
+        phase: _annotation_sample_bounds(table.iloc[position], sample_rate, len(signal))
+        for phase, position in required_positions.items()
+    }
+    context_start = absolute_bounds["s1"][0]
+    context_end = absolute_bounds["diastole"][1]
+    if context_end <= context_start:
+        raise ValueError("cardiac-cycle context is empty or reversed")
+    context = np.asarray(signal[context_start:context_end], dtype=float)
+    phase_bounds: dict[str, tuple[int, int]] = {}
+    phase_masks: dict[str, np.ndarray] = {}
+    for phase, (absolute_start, absolute_end) in absolute_bounds.items():
+        start = max(0, absolute_start - context_start)
+        end = min(len(context), absolute_end - context_start)
+        if end <= start:
+            raise ValueError(f"cardiac phase '{phase}' is empty after clipping")
+        mask = np.zeros(len(context), dtype=bool)
+        mask[start:end] = True
+        phase_bounds[phase] = (start, end)
+        phase_masks[phase] = mask
+    return CardiacCycleContext(
+        signal=context,
+        phase_masks=phase_masks,
+        phase_bounds=phase_bounds,
+        context_start_sample=context_start,
+        context_end_sample=context_end,
+    )
 
 
 def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[str, str]]:
@@ -115,11 +190,20 @@ def _write_diagnostic_plot(
     figure, axes = plt.subplots(5, 2, figsize=(15, 18))
     axes = axes.ravel()
     axes[0].plot(time, result.original, linewidth=0.7)
-    axes[0].set_title("Original systolic segment")
+    axes[0].set_title("Original complete cardiac-cycle context")
     axes[1].plot(time, result.original, linewidth=0.7)
-    axes[1].axvspan(time[0], time[-1], alpha=0.18, color="tab:blue", label="systole")
+    phase_colors = {
+        "s1": "tab:green",
+        "systole": "tab:blue",
+        "s2": "tab:orange",
+        "diastole": "tab:purple",
+    }
+    for phase, color in phase_colors.items():
+        start = metadata[f"{phase}_relative_start_sample"] / sample_rate
+        end = metadata[f"{phase}_relative_end_sample"] / sample_rate
+        axes[1].axvspan(start, end, alpha=0.18, color=color, label=phase)
     axes[1].legend(loc="upper right")
-    axes[1].set_title("TSV cardiac phase")
+    axes[1].set_title("TSV cardiac phases")
     axes[2].plot(time, result.normal_estimate, linewidth=0.7)
     axes[2].set_title("Normal-heart estimate")
     axes[3].plot(time, result.murmur_candidate, linewidth=0.7)
@@ -162,6 +246,9 @@ def _write_diagnostic_plot(
             "reconstruction_error",
             "normal_residual_correlation",
             "murmur_region_energy_retention",
+            "s1_leakage_ratio",
+            "s2_leakage_ratio",
+            "outside_murmur_energy_ratio",
             "noise_energy_ratio",
             "onset_normalized",
             "offset_normalized",
@@ -246,6 +333,7 @@ def run_audit(
     config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
     method: str = "auto",
     validate_first: bool = True,
+    run_name: str | None = None,
 ) -> pd.DataFrame:
     ensure_output_directories()
     if validate_first:
@@ -264,37 +352,69 @@ def run_audit(
             header=None,
             names=["start", "end", "state"],
         )
-        systoles = annotations[annotations["state"] == 2].head(cycles_per_recording)
-        for cycle_index, (_, annotation) in enumerate(systoles.iterrows()):
-            start_sample = int(round(float(annotation["start"]) * sample_rate))
-            end_sample = int(round(float(annotation["end"]) * sample_rate))
-            segment = signal[start_sample:end_sample]
-            if len(segment) < 8:
+        systole_positions = np.flatnonzero(annotations["state"].to_numpy() == 2)[
+            :cycles_per_recording
+        ]
+        for cycle_index, systole_position in enumerate(systole_positions):
+            try:
+                cycle = build_cardiac_cycle_context(
+                    signal, annotations, int(systole_position), sample_rate
+                )
+            except ValueError as exc:
+                print(f"Skipping {recording_id} cycle {cycle_index}: {exc}")
                 continue
             if method == "auto":
-                result, _ = compare_separation_methods(segment, config=config)
+                result, _ = compare_separation_methods(cycle.signal, config=config)
             else:
-                result = separate_signal(segment, config=config, method=method)
+                result = separate_signal(cycle.signal, config=config, method=method)
+            result.metrics.update(
+                real_proxy_metrics(
+                    result.original,
+                    result.normal_estimate,
+                    result.murmur_candidate,
+                    result.noise_candidate,
+                    sample_rate,
+                    threshold_mad=config.onset_threshold_mad,
+                    minimum_duration_ms=config.minimum_interval_duration_ms,
+                    merge_gap_ms=config.gap_merging_duration_ms,
+                    phase_masks=cycle.phase_masks,
+                )
+            )
             segment_metadata: dict[str, Any] = {
                 **recording,
                 "cycle_index": cycle_index,
-                "phase": "systole",
-                "start_sample": start_sample,
-                "end_sample": end_sample,
+                "phase": "complete_cycle",
+                "context_start_sample": cycle.context_start_sample,
+                "context_end_sample": cycle.context_end_sample,
                 "sample_rate": sample_rate,
             }
+            for phase, (relative_start, relative_end) in cycle.phase_bounds.items():
+                segment_metadata[f"{phase}_relative_start_sample"] = relative_start
+                segment_metadata[f"{phase}_relative_end_sample"] = relative_end
+                segment_metadata[f"{phase}_absolute_start_sample"] = (
+                    cycle.context_start_sample + relative_start
+                )
+                segment_metadata[f"{phase}_absolute_end_sample"] = (
+                    cycle.context_start_sample + relative_end
+                )
+            output_root = (
+                SEPARATION_OUTPUT_DIR / run_name
+                if run_name
+                else SEPARATION_OUTPUT_DIR
+            )
             directory = (
-                SEPARATION_OUTPUT_DIR
+                output_root
                 / recording_id
-                / f"cycle_{cycle_index}_systole"
+                / f"cycle_{cycle_index}_context"
             )
             summary_rows.append(
                 _save_segment_package(result, directory, segment_metadata, config)
             )
     summary = pd.DataFrame(summary_rows)
-    destination = REPORT_OUTPUT_DIR / "separation_summary.csv"
+    suffix = f"_{run_name}" if run_name else ""
+    destination = REPORT_OUTPUT_DIR / f"separation_summary{suffix}.csv"
     summary.to_csv(destination, index=False)
-    (REPORT_OUTPUT_DIR / "separation_config.json").write_text(
+    (REPORT_OUTPUT_DIR / f"separation_config{suffix}.json").write_text(
         json.dumps(config.to_dict(), indent=2), encoding="utf-8"
     )
     return summary
@@ -308,6 +428,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--energy-threshold", type=float, default=0.99)
     parser.add_argument("--use-dwt", action="store_true")
     parser.add_argument("--skip-dataset-validation", action="store_true")
+    parser.add_argument(
+        "--run-name",
+        help="Optional label used to isolate outputs and comparison reports",
+    )
     args = parser.parse_args(argv)
     config = replace(
         DEFAULT_SEPARATION_CONFIG,
@@ -320,9 +444,11 @@ def main(argv: list[str] | None = None) -> int:
         config=config,
         method=args.method,
         validate_first=not args.skip_dataset_validation,
+        run_name=args.run_name,
     )
     print(f"Processed segments: {len(summary)}")
-    print(f"Summary: {REPORT_OUTPUT_DIR / 'separation_summary.csv'}")
+    suffix = f"_{args.run_name}" if args.run_name else ""
+    print(f"Summary: {REPORT_OUTPUT_DIR / f'separation_summary{suffix}.csv'}")
     return 0
 
 
