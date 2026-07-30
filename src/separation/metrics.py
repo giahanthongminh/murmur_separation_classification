@@ -53,29 +53,44 @@ def detect_activity_interval(
     threshold_mad: float = 3.0,
     minimum_duration_ms: float = 30.0,
     merge_gap_ms: float = 20.0,
-) -> dict[str, float | None]:
-    """Detect candidate activity within one already-restricted cardiac phase."""
+) -> dict[str, float | str | None]:
+    """Detect activity inside a short cardiac phase with an energy fallback."""
 
     values = np.asarray(signal, dtype=float)
     if values.size == 0:
         return _empty_activity()
-    envelope = np.abs(hilbert(values))
-    smoothing = max(1, int(round(sample_rate * 0.02)))
+    if not np.all(np.isfinite(values)) or energy(values) <= EPSILON:
+        return _empty_activity()
+    envelope = np.abs(hilbert(values)) if len(values) > 2 else np.abs(values)
+    # Use 5 ms smoothing, capped at 10% of the phase, so 70--200 ms
+    # candidates are not flattened by the previous fixed 20 ms window.
+    smoothing = min(
+        len(values),
+        max(1, min(int(round(sample_rate * 0.005)), len(values) // 10)),
+    )
     kernel = np.ones(smoothing, dtype=float) / smoothing
     smooth = np.convolve(envelope, kernel, mode="same")
-    baseline = float(np.median(smooth))
+    baseline = float(np.percentile(smooth, 20))
     mad = float(np.median(np.abs(smooth - baseline)))
-    threshold = baseline + threshold_mad * 1.4826 * mad
-    active = smooth > threshold
+    raw_threshold = baseline + threshold_mad * 1.4826 * mad
+    peak_limited_threshold = baseline + 0.60 * (float(np.max(smooth)) - baseline)
+    threshold = min(raw_threshold, peak_limited_threshold)
+    active = smooth >= threshold
 
-    merge_gap = max(0, int(round(merge_gap_ms * sample_rate / 1000.0)))
+    merge_gap = min(
+        max(0, int(round(merge_gap_ms * sample_rate / 1000.0))),
+        max(1, len(values) // 10),
+    )
     if merge_gap and active.any():
         indexes = np.flatnonzero(active)
         for left, right in zip(indexes[:-1], indexes[1:]):
             if right - left - 1 <= merge_gap:
                 active[left : right + 1] = True
 
-    minimum = max(1, int(round(minimum_duration_ms * sample_rate / 1000.0)))
+    minimum = min(
+        max(1, int(round(minimum_duration_ms * sample_rate / 1000.0))),
+        max(2, int(round(0.15 * len(values)))),
+    )
     valid_intervals: list[tuple[int, int]] = []
     changes = np.diff(np.pad(active.astype(np.int8), (1, 1)))
     starts = np.flatnonzero(changes == 1)
@@ -83,12 +98,20 @@ def detect_activity_interval(
     for start, end in zip(starts, ends):
         if end - start >= minimum:
             valid_intervals.append((int(start), int(end)))
-    if not valid_intervals:
-        return _empty_activity()
-
-    start = valid_intervals[0][0]
-    end = valid_intervals[-1][1]
     phase_energy = values**2
+    if valid_intervals:
+        start = valid_intervals[0][0]
+        end = valid_intervals[-1][1]
+        detection_method = "adaptive_envelope"
+    else:
+        # A non-silent short candidate should still receive auditable timing.
+        # The 5--95% cumulative-energy interval is stable and bounded even when
+        # no envelope run survives duration filtering.
+        cumulative = np.cumsum(phase_energy)
+        cumulative /= cumulative[-1]
+        start = int(np.searchsorted(cumulative, 0.05))
+        end = min(len(values), int(np.searchsorted(cumulative, 0.95)) + 1)
+        detection_method = "energy_quantile_fallback"
     positions = np.arange(len(values), dtype=float) / max(1, len(values) - 1)
     total = float(phase_energy.sum())
     return {
@@ -99,17 +122,32 @@ def detect_activity_interval(
             np.sum(positions * phase_energy) / (total + EPSILON)
         ),
         "peak_position": float(np.argmax(smooth) / max(1, len(values) - 1)),
+        "activity_detection_method": detection_method,
+        "activity_threshold": float(threshold),
     }
 
 
-def _empty_activity() -> dict[str, None]:
+def _empty_activity() -> dict[str, float | str | None]:
     return {
         "onset_normalized": None,
         "offset_normalized": None,
         "duration_ratio": None,
         "temporal_energy_centroid": None,
         "peak_position": None,
+        "activity_detection_method": "silent_or_invalid",
+        "activity_threshold": None,
     }
+
+
+def _validated_phase_mask(
+    phase_masks: dict[str, np.ndarray], name: str, length: int
+) -> np.ndarray:
+    if name not in phase_masks:
+        raise ValueError(f"phase_masks is missing '{name}'")
+    mask = np.asarray(phase_masks[name], dtype=bool)
+    if mask.shape != (length,) or not mask.any():
+        raise ValueError(f"phase mask '{name}' must select samples from the context")
+    return mask
 
 
 def real_proxy_metrics(
@@ -122,16 +160,45 @@ def real_proxy_metrics(
     threshold_mad: float = 3.0,
     minimum_duration_ms: float = 30.0,
     merge_gap_ms: float = 20.0,
-) -> dict[str, float | None]:
+    phase_masks: dict[str, np.ndarray] | None = None,
+) -> dict[str, float | str | None]:
     original_energy = energy(original)
     reconstructed = normal + murmur_candidate + noise_candidate
     reconstruction_error = float(
         np.linalg.norm(np.asarray(original) - reconstructed)
         / (np.linalg.norm(original) + EPSILON)
     )
-    spectral = spectral_features(murmur_candidate, sample_rate)
+    if phase_masks is None:
+        timing_candidate = np.asarray(murmur_candidate)
+        murmur_region_energy_retention = energy(murmur_candidate) / (
+            original_energy + EPSILON
+        )
+        s1_leakage_ratio = None
+        s2_leakage_ratio = None
+        outside_murmur_energy_ratio = None
+    else:
+        length = len(np.asarray(original))
+        s1_mask = _validated_phase_mask(phase_masks, "s1", length)
+        systole_mask = _validated_phase_mask(phase_masks, "systole", length)
+        s2_mask = _validated_phase_mask(phase_masks, "s2", length)
+        candidate_values = np.asarray(murmur_candidate)
+        original_values = np.asarray(original)
+        timing_candidate = candidate_values[systole_mask]
+        s1_leakage_ratio = energy(candidate_values[s1_mask]) / (
+            energy(original_values[s1_mask]) + EPSILON
+        )
+        s2_leakage_ratio = energy(candidate_values[s2_mask]) / (
+            energy(original_values[s2_mask]) + EPSILON
+        )
+        murmur_region_energy_retention = energy(candidate_values[systole_mask]) / (
+            energy(original_values[systole_mask]) + EPSILON
+        )
+        outside_murmur_energy_ratio = energy(candidate_values[~systole_mask]) / (
+            energy(candidate_values) + EPSILON
+        )
+    spectral = spectral_features(timing_candidate, sample_rate)
     timing = detect_activity_interval(
-        murmur_candidate,
+        timing_candidate,
         sample_rate,
         threshold_mad=threshold_mad,
         minimum_duration_ms=minimum_duration_ms,
@@ -140,13 +207,10 @@ def real_proxy_metrics(
     return {
         "reconstruction_error": reconstruction_error,
         "normal_residual_correlation": safe_correlation(normal, murmur_candidate),
-        # A systolic-only segment contains neither full S1 nor full S2. These are
-        # explicitly unavailable rather than silently reported as zero.
-        "s1_leakage_ratio": None,
-        "s2_leakage_ratio": None,
-        "murmur_region_energy_retention": energy(murmur_candidate)
-        / (original_energy + EPSILON),
-        "outside_murmur_energy_ratio": None,
+        "s1_leakage_ratio": s1_leakage_ratio,
+        "s2_leakage_ratio": s2_leakage_ratio,
+        "murmur_region_energy_retention": murmur_region_energy_retention,
+        "outside_murmur_energy_ratio": outside_murmur_energy_ratio,
         "noise_energy_ratio": energy(noise_candidate) / (original_energy + EPSILON),
         "residual_spectral_centroid": spectral["spectral_centroid"],
         "residual_bandwidth": spectral["spectral_bandwidth"],

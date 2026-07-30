@@ -27,13 +27,19 @@ On the audited local snapshot, counts are correct but strict validation intentio
 python -m src.separation.audit --limit 20
 ```
 
-Each selected systolic cycle is processed separately and receives:
+Each selected contiguous S1-systole-S2-diastole cycle is processed separately and receives:
 
 - `original`, `normal_estimate`, `murmur_candidate`, and `noise_candidate` as NPY and WAV;
 - `component_features.csv` and `selected_components.json`;
 - `metrics.json` and `diagnostic_plot.png`.
 
 The summary is `outputs/reports/separation_summary.csv`. Use `--energy-threshold` to compare 0.95, 0.975, 0.99, and 0.995. DWT is an opt-in ablation via `--use-dwt`, not an assumed improvement.
+
+Real-audit timing is normalized within the annotated systole. S1 and S2
+leakage are candidate energy in each heart-sound phase divided by original
+energy in that phase. Outside-murmur energy is candidate energy outside the
+annotated systole divided by total candidate energy. Use `--run-name` to keep
+method outputs and reports isolated during direct comparisons.
 
 ## Synthetic ground truth
 
