@@ -83,3 +83,12 @@ The refactor preserves the historical functions where practical while adding:
 Legacy classifier experiments are retained. Their paths are redirected to project outputs; they are not used to decide whether separation is valid.
 
 The repaired real-data audit processes each contiguous S1-systole-S2-diastole cycle without concatenating disjoint intervals. Timing is detected and normalized only within the systolic mask. `s1_leakage_ratio` and `s2_leakage_ratio` measure candidate energy in each heart-sound phase relative to original phase energy, while `outside_murmur_energy_ratio` measures the fraction of total candidate energy outside the annotated systole. This supplies full-cycle leakage context while retaining cycle identity.
+
+Phase-aware component selection now augments ZCR or kurtosis assignment with
+per-phase energy density. A provisional murmur component must meet configured
+systolic-focus and systole-to-S1/S2 thresholds. Rejected components are assigned
+whole to the normal-heart estimate rather than truncated at phase boundaries,
+preserving exact reconstruction and allowing the leakage metrics to remain an
+honest audit. A single best-component fallback keeps short-candidate timing
+measurable when no component passes and is exposed as low confidence in the
+component table and summary metrics.

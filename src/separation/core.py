@@ -42,8 +42,53 @@ def kurtosis_score(signal: np.ndarray) -> float:
     return float(np.mean((centered / deviation) ** 4) - 3.0)
 
 
+def _validate_phase_masks(
+    phase_masks: dict[str, np.ndarray] | None, length: int
+) -> dict[str, np.ndarray] | None:
+    if phase_masks is None:
+        return None
+    required = ("s1", "systole", "s2", "diastole")
+    validated: dict[str, np.ndarray] = {}
+    for phase in required:
+        if phase not in phase_masks:
+            raise ValueError(f"phase_masks must include '{phase}'")
+        mask = np.asarray(phase_masks[phase], dtype=bool)
+        if mask.shape != (length,):
+            raise ValueError(
+                f"phase mask '{phase}' has shape {mask.shape}; expected ({length},)"
+            )
+        if not mask.any():
+            raise ValueError(f"phase mask '{phase}' must select at least one sample")
+        validated[phase] = mask
+    overlap = np.sum(np.stack(list(validated.values())), axis=0)
+    if np.any(overlap > 1):
+        raise ValueError("cardiac phase masks must not overlap")
+    return validated
+
+
+def _phase_energy_features(
+    component: np.ndarray, phase_masks: dict[str, np.ndarray]
+) -> dict[str, float]:
+    component_energy = energy(component) + EPSILON
+    densities: dict[str, float] = {}
+    features: dict[str, float] = {}
+    for phase, mask in phase_masks.items():
+        phase_energy = energy(component[mask])
+        densities[phase] = phase_energy / int(mask.sum())
+        features[f"{phase}_energy_fraction"] = phase_energy / component_energy
+        features[f"{phase}_energy_density"] = densities[phase]
+    density_total = sum(densities.values()) + EPSILON
+    features["systole_focus_score"] = densities["systole"] / density_total
+    features["systole_to_s1_s2_ratio"] = densities["systole"] / (
+        densities["s1"] + densities["s2"] + EPSILON
+    )
+    return features
+
+
 def _component_table(
-    ssa: SSAResult, sample_rate: int
+    ssa: SSAResult,
+    sample_rate: int,
+    phase_masks: dict[str, np.ndarray] | None = None,
 ) -> list[dict[str, Any]]:
     total_energy = sum(energy(component) for component in ssa.components) + EPSILON
     rows: list[dict[str, Any]] = []
@@ -57,24 +102,25 @@ def _component_table(
         high = float(spectrum[frequencies >= 600].sum())
         spectral_total = low + mid + high + EPSILON
         rms = float(np.sqrt(np.mean(component**2)))
-        rows.append(
-            {
-                "component_index": index,
-                "active_by_energy": index < ssa.active_component_count,
-                "singular_value": float(ssa.singular_values[index]),
-                "relative_energy": energy(component) / total_energy,
-                "zcr": zero_crossing_rate(component),
-                "kurtosis": kurtosis_score(component),
-                "spectral_centroid": spectral["spectral_centroid"],
-                "spectral_bandwidth": spectral["spectral_bandwidth"],
-                "dominant_frequency": spectral["dominant_frequency"],
-                "low_band_ratio": low / spectral_total,
-                "mid_band_ratio": mid / spectral_total,
-                "high_band_ratio": high / spectral_total,
-                "impulsiveness": float(np.max(np.abs(component)) / (rms + EPSILON)),
-                "nyquist_ratio": spectral["spectral_centroid"] / max(nyquist, 1.0),
-            }
-        )
+        row: dict[str, Any] = {
+            "component_index": index,
+            "active_by_energy": index < ssa.active_component_count,
+            "singular_value": float(ssa.singular_values[index]),
+            "relative_energy": energy(component) / total_energy,
+            "zcr": zero_crossing_rate(component),
+            "kurtosis": kurtosis_score(component),
+            "spectral_centroid": spectral["spectral_centroid"],
+            "spectral_bandwidth": spectral["spectral_bandwidth"],
+            "dominant_frequency": spectral["dominant_frequency"],
+            "low_band_ratio": low / spectral_total,
+            "mid_band_ratio": mid / spectral_total,
+            "high_band_ratio": high / spectral_total,
+            "impulsiveness": float(np.max(np.abs(component)) / (rms + EPSILON)),
+            "nyquist_ratio": spectral["spectral_centroid"] / max(nyquist, 1.0),
+        }
+        if phase_masks is not None:
+            row.update(_phase_energy_features(component, phase_masks))
+        rows.append(row)
     return rows
 
 
@@ -160,6 +206,38 @@ def _kurtosis_normal_indexes(
     return [eligible[index] for index in np.flatnonzero(best)]
 
 
+def _phase_aware_murmur_indexes(
+    rows: list[dict[str, Any]],
+    provisional_indexes: list[int],
+    config: SeparationConfig,
+) -> tuple[list[int], list[int], bool]:
+    """Filter provisional murmur components using full-cycle phase energy."""
+
+    selected = [
+        index
+        for index in provisional_indexes
+        if rows[index]["systole_focus_score"] >= config.minimum_systole_focus
+        and rows[index]["systole_to_s1_s2_ratio"]
+        >= config.minimum_systole_to_s1_s2_ratio
+    ]
+    used_fallback = False
+    if not selected and provisional_indexes and config.phase_selection_fallback:
+        selected = [
+            max(
+                provisional_indexes,
+                key=lambda index: (
+                    rows[index]["systole_focus_score"],
+                    rows[index]["systole_to_s1_s2_ratio"],
+                    rows[index]["relative_energy"],
+                ),
+            )
+        ]
+        used_fallback = True
+    selected_set = set(selected)
+    rejected = [index for index in provisional_indexes if index not in selected_set]
+    return selected, rejected, used_fallback
+
+
 def _sum_components(components: np.ndarray, indexes: list[int], length: int) -> np.ndarray:
     return (
         components[indexes].sum(axis=0)
@@ -173,10 +251,12 @@ def separate_signal(
     *,
     config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
     method: str = "zcr",
+    phase_masks: dict[str, np.ndarray] | None = None,
 ) -> SeparationResult:
     """Separate one cardiac-phase segment into normal, murmur, and noise candidates."""
 
     values = np.asarray(signal, dtype=float)
+    validated_phase_masks = _validate_phase_masks(phase_masks, len(values))
     window = min(config.ssa_window_length, max(2, len(values) // 4))
     ssa = ssa_decompose_audited(
         values,
@@ -185,7 +265,7 @@ def separate_signal(
         maximum_components=config.maximum_ssa_components,
         reconstruction_tolerance=config.reconstruction_tolerance,
     )
-    rows = _component_table(ssa, config.sample_rate)
+    rows = _component_table(ssa, config.sample_rate, validated_phase_masks)
     noise_indexes = _noise_indexes(rows, config)
     eligible = [
         index
@@ -200,7 +280,30 @@ def separate_signal(
         )
     else:
         raise ValueError("method must be 'zcr' or 'kurtosis'")
-    murmur_indexes = [index for index in eligible if index not in set(normal_indexes)]
+    provisional_murmur_indexes = [
+        index for index in eligible if index not in set(normal_indexes)
+    ]
+    noise_index_set = set(noise_indexes)
+    normal_index_set = set(normal_indexes)
+    base_assignment = {
+        index: "noise_artifact"
+        if index in noise_index_set
+        else "normal"
+        if index in normal_index_set
+        else "murmur_candidate"
+        for index in range(len(rows))
+    }
+    phase_rejected_indexes: list[int] = []
+    phase_selection_used_fallback = False
+    if validated_phase_masks is not None and config.phase_aware_component_selection:
+        (
+            murmur_indexes,
+            phase_rejected_indexes,
+            phase_selection_used_fallback,
+        ) = _phase_aware_murmur_indexes(rows, provisional_murmur_indexes, config)
+        normal_indexes = sorted(normal_indexes + phase_rejected_indexes)
+    else:
+        murmur_indexes = provisional_murmur_indexes
     normal = _sum_components(ssa.components, normal_indexes, len(values))
     murmur = _sum_components(ssa.components, murmur_indexes, len(values))
     noise = _sum_components(ssa.components, noise_indexes, len(values))
@@ -225,8 +328,15 @@ def separate_signal(
     assignment_by_index = {
         index: label for label, indexes in assignments.items() for index in indexes
     }
+    murmur_index_set = set(murmur_indexes)
     for row in rows:
-        row["assignment"] = assignment_by_index[int(row["component_index"])]
+        index = int(row["component_index"])
+        row["base_assignment"] = base_assignment[index]
+        row["assignment"] = assignment_by_index[index]
+        row["phase_murmur_eligible"] = index in murmur_index_set
+        row["phase_selection_fallback"] = (
+            phase_selection_used_fallback and index in murmur_index_set
+        )
 
     metrics = real_proxy_metrics(
         values,
@@ -237,6 +347,7 @@ def separate_signal(
         threshold_mad=config.onset_threshold_mad,
         minimum_duration_ms=config.minimum_interval_duration_ms,
         merge_gap_ms=config.gap_merging_duration_ms,
+        phase_masks=validated_phase_masks,
     )
     metrics.update(
         {
@@ -245,6 +356,13 @@ def separate_signal(
             "ssa_total_component_count": len(ssa.components),
             "ssa_explained_energy": ssa.explained_energy,
             "selected_method": method + ("+dwt" if config.use_dwt else ""),
+            "phase_aware_selection_applied": bool(
+                validated_phase_masks is not None
+                and config.phase_aware_component_selection
+            ),
+            "phase_selected_component_count": len(murmur_indexes),
+            "phase_rejected_component_count": len(phase_rejected_indexes),
+            "phase_selection_used_fallback": phase_selection_used_fallback,
             "config_hash": config.config_hash,
         }
     )
@@ -280,11 +398,14 @@ def compare_separation_methods(
     signal: np.ndarray,
     *,
     config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
+    phase_masks: dict[str, np.ndarray] | None = None,
 ) -> tuple[SeparationResult, dict[str, SeparationResult]]:
     """Choose between configured methods with a multi-metric plausibility score."""
 
     candidates = {
-        method: separate_signal(signal, config=config, method=method)
+        method: separate_signal(
+            signal, config=config, method=method, phase_masks=phase_masks
+        )
         for method in ("zcr", "kurtosis")
     }
     for result in candidates.values():

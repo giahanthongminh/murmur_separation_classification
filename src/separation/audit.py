@@ -253,6 +253,9 @@ def _write_diagnostic_plot(
             "onset_normalized",
             "offset_normalized",
             "selection_score",
+            "phase_selected_component_count",
+            "phase_rejected_component_count",
+            "phase_selection_used_fallback",
         }
     ]
     def preview(indexes: list[int]) -> str:
@@ -364,9 +367,16 @@ def run_audit(
                 print(f"Skipping {recording_id} cycle {cycle_index}: {exc}")
                 continue
             if method == "auto":
-                result, _ = compare_separation_methods(cycle.signal, config=config)
+                result, _ = compare_separation_methods(
+                    cycle.signal, config=config, phase_masks=cycle.phase_masks
+                )
             else:
-                result = separate_signal(cycle.signal, config=config, method=method)
+                result = separate_signal(
+                    cycle.signal,
+                    config=config,
+                    method=method,
+                    phase_masks=cycle.phase_masks,
+                )
             result.metrics.update(
                 real_proxy_metrics(
                     result.original,
@@ -427,6 +437,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--method", choices=["auto", "zcr", "kurtosis"], default="auto")
     parser.add_argument("--energy-threshold", type=float, default=0.99)
     parser.add_argument("--use-dwt", action="store_true")
+    parser.add_argument("--disable-phase-aware-selection", action="store_true")
+    parser.add_argument(
+        "--minimum-systole-focus",
+        type=float,
+        default=DEFAULT_SEPARATION_CONFIG.minimum_systole_focus,
+    )
+    parser.add_argument(
+        "--minimum-systole-to-s1-s2-ratio",
+        type=float,
+        default=DEFAULT_SEPARATION_CONFIG.minimum_systole_to_s1_s2_ratio,
+    )
+    parser.add_argument("--disable-phase-selection-fallback", action="store_true")
     parser.add_argument("--skip-dataset-validation", action="store_true")
     parser.add_argument(
         "--run-name",
@@ -437,6 +459,10 @@ def main(argv: list[str] | None = None) -> int:
         DEFAULT_SEPARATION_CONFIG,
         explained_energy_threshold=args.energy_threshold,
         use_dwt=args.use_dwt,
+        phase_aware_component_selection=not args.disable_phase_aware_selection,
+        minimum_systole_focus=args.minimum_systole_focus,
+        minimum_systole_to_s1_s2_ratio=args.minimum_systole_to_s1_s2_ratio,
+        phase_selection_fallback=not args.disable_phase_selection_fallback,
     )
     summary = run_audit(
         limit=args.limit,

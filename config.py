@@ -50,6 +50,10 @@ class SeparationConfig:
     zcr_threshold_strategy: str = "percentile"
     zcr_threshold: float = 0.05
     zcr_percentile: float = 40.0
+    phase_aware_component_selection: bool = True
+    minimum_systole_focus: float = 0.12
+    minimum_systole_to_s1_s2_ratio: float = 0.20
+    phase_selection_fallback: bool = True
     kurtosis_population_size: int = 30
     kurtosis_generations: int = 40
     kurtosis_mutation_rate: float = 0.05
@@ -75,6 +79,10 @@ class SeparationConfig:
             raise ValueError("maximum_ssa_components must be positive or None")
         if self.zcr_threshold_strategy not in {"fixed", "percentile"}:
             raise ValueError("zcr_threshold_strategy must be 'fixed' or 'percentile'")
+        if not 0 <= self.minimum_systole_focus <= 1:
+            raise ValueError("minimum_systole_focus must be in [0, 1]")
+        if self.minimum_systole_to_s1_s2_ratio < 0:
+            raise ValueError("minimum_systole_to_s1_s2_ratio must be non-negative")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
