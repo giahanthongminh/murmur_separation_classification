@@ -363,6 +363,16 @@ def separate_signal(
             "phase_selected_component_count": len(murmur_indexes),
             "phase_rejected_component_count": len(phase_rejected_indexes),
             "phase_selection_used_fallback": phase_selection_used_fallback,
+            "candidate_quality_status": (
+                "not_assessed"
+                if validated_phase_masks is None
+                or not config.phase_aware_component_selection
+                else "fallback"
+                if phase_selection_used_fallback
+                else "no_candidate"
+                if not murmur_indexes
+                else "accepted"
+            ),
             "config_hash": config.config_hash,
         }
     )

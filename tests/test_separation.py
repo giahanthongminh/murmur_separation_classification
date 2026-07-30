@@ -11,7 +11,11 @@ from src.separation.core import (
     _phase_energy_features,
     separate_signal,
 )
-from src.separation.audit import build_cardiac_cycle_context
+from src.separation.audit import (
+    build_cardiac_cycle_context,
+    classify_audit_outcome,
+    summarize_audit_quality,
+)
 from src.separation.metrics import detect_activity_interval, real_proxy_metrics
 from src.ssa import select_component_count, ssa_decompose_audited
 
@@ -161,6 +165,7 @@ def test_phase_aware_outputs_preserve_full_cycle_reconstruction() -> None:
     )
     np.testing.assert_allclose(reconstructed, signal, atol=1e-10)
     assert result.metrics["phase_aware_selection_applied"]
+    assert result.metrics["candidate_quality_status"] in {"accepted", "fallback"}
     assert result.metrics["onset_normalized"] is not None
     assert result.metrics["offset_normalized"] is not None
     assert all(
@@ -169,6 +174,51 @@ def test_phase_aware_outputs_preserve_full_cycle_reconstruction() -> None:
         and "base_assignment" in row
         for row in result.component_features
     )
+
+
+def test_quality_summary_keeps_fallback_separate() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "candidate_quality_status": "accepted",
+                "murmur_label": "Present",
+                "s1_leakage_ratio": 0.1,
+                "s2_leakage_ratio": 0.2,
+                "outside_murmur_energy_ratio": 0.3,
+                "murmur_region_energy_retention": 0.4,
+            },
+            {
+                "candidate_quality_status": "fallback",
+                "murmur_label": "Present",
+                "s1_leakage_ratio": 0.9,
+                "s2_leakage_ratio": 0.8,
+                "outside_murmur_energy_ratio": 0.7,
+                "murmur_region_energy_retention": 0.01,
+            },
+        ]
+    )
+    quality = summarize_audit_quality(frame).set_index("candidate_quality_status")
+    assert quality.loc["accepted", "segment_count"] == 1
+    assert quality.loc["accepted", "s1_leakage_ratio"] == pytest.approx(0.1)
+    assert quality.loc["fallback", "s1_leakage_ratio"] == pytest.approx(0.9)
+    assert quality.loc["accepted", "audit_outcome"] == "present_candidate_accepted"
+    assert quality.loc["fallback", "audit_outcome"] == "present_candidate_missed"
+
+
+@pytest.mark.parametrize(
+    ("label", "status", "expected"),
+    [
+        ("Present", "accepted", "present_candidate_accepted"),
+        ("Present", "fallback", "present_candidate_missed"),
+        ("Absent", "accepted", "absent_candidate_flagged"),
+        ("Absent", "fallback", "absent_negative_control_clear"),
+        ("Unknown", "accepted", "unscored_unknown_label"),
+    ],
+)
+def test_audit_outcome_is_label_aware(
+    label: str, status: str, expected: str
+) -> None:
+    assert classify_audit_outcome(label, status) == expected
 
 
 @pytest.mark.parametrize("duration_ms", [70, 100, 200])

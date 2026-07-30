@@ -96,3 +96,36 @@ preserving exact reconstruction and allowing the leakage metrics to remain an
 honest audit. A single best-component fallback keeps short-candidate timing
 measurable when no component passes and is exposed as low confidence in the
 component table and summary metrics.
+
+Phase thresholds and SSA window duration are tuned only on synthetic
+full-cycle mixtures with known normal/murmur/noise stems and absent-murmur
+controls. The selection rule first keeps configurations within 0.5 dB of the
+best mean murmur SI-SDR, then uses fallback rate, absent false-candidate energy,
+normal leakage, outside-systole energy, and retention as ordered tie-breakers.
+The frozen real 59-segment audit is evaluation-only and is not used to choose
+these settings.
+
+## Frozen 59-segment acceptance decision
+
+The full synthetic grid evaluated 3,264 separations across 48 phase/window
+configurations. Its candidate (`20 ms` SSA window, systolic focus `0.06`, and
+systole-to-S1/S2 ratio `0.30`) improved synthetic mean murmur SI-SDR from
+`2.58 dB` to `4.81 dB` relative to the established defaults. On the one-shot
+frozen real audit, however, present-recording fallback increased from `9/36`
+to `11/36` and present accepted-candidate retention decreased. The candidate
+was therefore rejected and the prior defaults remain in place.
+
+With the retained defaults, label-aware quality gating reports:
+
+- present candidate accepted: `27/36` cycles (75%);
+- present candidate missed: `9/36` cycles (25%);
+- absent negative control clear: `6/15` cycles (40%);
+- absent candidate flagged: `9/15` cycles (60%);
+- one annotation-invalid cycle skipped, leaving 59 evaluated segments.
+
+Among present accepted candidates, mean S1 leakage is `0.0427`, mean S2
+leakage is `0.0580`, outside-systole energy is `0.6377`, and systolic retention
+is `0.1766`. These results do not pass separation acceptance. The reporting
+and tuning infrastructure is usable, but the current CSSA component-selection
+algorithm must not be treated as a validated murmur source or used to expand
+classifier experiments.

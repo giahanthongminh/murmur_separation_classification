@@ -283,6 +283,7 @@ def _write_diagnostic_plot(
             "phase_selected_component_count",
             "phase_rejected_component_count",
             "phase_selection_used_fallback",
+            "candidate_quality_status",
         }
     ]
     def preview(indexes: list[int]) -> str:
@@ -354,6 +355,60 @@ def _save_segment_package(
         result, directory / "diagnostic_plot.png", config.sample_rate, metadata
     )
     return metrics
+
+
+def classify_audit_outcome(murmur_label: str, quality_status: str) -> str:
+    """Interpret selector confidence against the recording-level murmur label."""
+
+    accepted = quality_status == "accepted"
+    if murmur_label == "Present":
+        return "present_candidate_accepted" if accepted else "present_candidate_missed"
+    if murmur_label == "Absent":
+        return "absent_candidate_flagged" if accepted else "absent_negative_control_clear"
+    return "unscored_unknown_label"
+
+
+def summarize_audit_quality(summary: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate accepted and low-confidence candidates without mixing them."""
+
+    columns = [
+        "candidate_quality_status",
+        "murmur_label",
+        "audit_outcome",
+        "segment_count",
+        "s1_leakage_ratio",
+        "s2_leakage_ratio",
+        "outside_murmur_energy_ratio",
+        "murmur_region_energy_retention",
+    ]
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    required = {"candidate_quality_status", "murmur_label"}
+    missing = required - set(summary.columns)
+    if missing:
+        raise ValueError(f"audit summary is missing quality columns: {sorted(missing)}")
+    metrics = [
+        "s1_leakage_ratio",
+        "s2_leakage_ratio",
+        "outside_murmur_energy_ratio",
+        "murmur_region_energy_retention",
+    ]
+    table = summary.copy()
+    if "audit_outcome" not in table:
+        table["audit_outcome"] = [
+            classify_audit_outcome(str(label), str(status))
+            for label, status in zip(
+                table["murmur_label"], table["candidate_quality_status"]
+            )
+        ]
+    grouped = table.groupby(
+        ["candidate_quality_status", "murmur_label", "audit_outcome"],
+        dropna=False,
+        sort=True,
+    )
+    counts = grouped.size().rename("segment_count")
+    means = grouped[metrics].mean()
+    return pd.concat([counts, means], axis=1).reset_index()[columns]
 
 
 def run_audit(
@@ -434,6 +489,10 @@ def run_audit(
                 segment_metadata[f"{phase}_absolute_end_sample"] = (
                     cycle.context_start_sample + relative_end
                 )
+            segment_metadata["audit_outcome"] = classify_audit_outcome(
+                str(recording["murmur_label"]),
+                str(result.metrics["candidate_quality_status"]),
+            )
             output_root = (
                 SEPARATION_OUTPUT_DIR / run_name
                 if run_name
@@ -451,6 +510,21 @@ def run_audit(
     suffix = f"_{run_name}" if run_name else ""
     destination = REPORT_OUTPUT_DIR / f"separation_summary{suffix}.csv"
     summary.to_csv(destination, index=False)
+    accepted = summary[
+        summary.get("candidate_quality_status", pd.Series(dtype=str)).eq("accepted")
+    ]
+    accepted.to_csv(
+        REPORT_OUTPUT_DIR / f"separation_summary{suffix}_accepted.csv", index=False
+    )
+    present_accepted = accepted[accepted.get("murmur_label", "").eq("Present")]
+    present_accepted.to_csv(
+        REPORT_OUTPUT_DIR
+        / f"separation_summary{suffix}_present_accepted.csv",
+        index=False,
+    )
+    summarize_audit_quality(summary).to_csv(
+        REPORT_OUTPUT_DIR / f"separation_quality{suffix}.csv", index=False
+    )
     (REPORT_OUTPUT_DIR / f"separation_config{suffix}.json").write_text(
         json.dumps(config.to_dict(), indent=2), encoding="utf-8"
     )
@@ -463,6 +537,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cycles-per-recording", type=int, default=1)
     parser.add_argument("--method", choices=["auto", "zcr", "kurtosis"], default="auto")
     parser.add_argument("--energy-threshold", type=float, default=0.99)
+    parser.add_argument(
+        "--ssa-window-length",
+        type=int,
+        default=DEFAULT_SEPARATION_CONFIG.ssa_window_length,
+    )
     parser.add_argument("--use-dwt", action="store_true")
     parser.add_argument("--disable-phase-aware-selection", action="store_true")
     parser.add_argument(
@@ -485,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     config = replace(
         DEFAULT_SEPARATION_CONFIG,
         explained_energy_threshold=args.energy_threshold,
+        ssa_window_length=args.ssa_window_length,
         use_dwt=args.use_dwt,
         phase_aware_component_selection=not args.disable_phase_aware_selection,
         minimum_systole_focus=args.minimum_systole_focus,
@@ -500,8 +580,20 @@ def main(argv: list[str] | None = None) -> int:
         run_name=args.run_name,
     )
     print(f"Processed segments: {len(summary)}")
+    if "candidate_quality_status" in summary:
+        counts = summary["candidate_quality_status"].value_counts().to_dict()
+        print(f"Candidate quality: {counts}")
     suffix = f"_{args.run_name}" if args.run_name else ""
     print(f"Summary: {REPORT_OUTPUT_DIR / f'separation_summary{suffix}.csv'}")
+    print(
+        "Accepted summary: "
+        f"{REPORT_OUTPUT_DIR / f'separation_summary{suffix}_accepted.csv'}"
+    )
+    print(
+        "Present accepted summary: "
+        f"{REPORT_OUTPUT_DIR / f'separation_summary{suffix}_present_accepted.csv'}"
+    )
+    print(f"Quality report: {REPORT_OUTPUT_DIR / f'separation_quality{suffix}.csv'}")
     return 0
 
 

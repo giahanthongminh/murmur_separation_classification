@@ -48,10 +48,20 @@ the normal-heart estimate, so reconstruction remains exact and leakage is not
 hidden by zeroing samples outside systole. If no component passes, the most
 systole-focused provisional component is retained and
 `phase_selection_used_fallback` is recorded for low-confidence review.
+The audit also writes `candidate_quality_status` and separate all-segment,
+accepted-only, and quality-stratified reports so fallback candidates cannot be
+silently mixed into aggregate separation metrics.
 Use `--disable-phase-aware-selection` for a baseline ablation, or adjust
 `--minimum-systole-focus` and `--minimum-systole-to-s1-s2-ratio` in explicit
 threshold studies. `--disable-phase-selection-fallback` exposes cases where no
 provisional component satisfies the phase criteria.
+
+Phase-aware candidates are tuned by the full-cycle synthetic ground-truth grid
+rather than the real audit set. Run
+`python -m src.evaluation.synthetic_benchmark --tune-phase-thresholds` to
+reproduce `phase_threshold_tuning*.csv` and the selected JSON candidate. A
+candidate configuration is adopted only if it also passes the one-shot frozen
+real-audit acceptance check; otherwise the established defaults remain locked.
 
 ## Synthetic ground truth
 
@@ -67,3 +77,8 @@ Ground-truth mixtures and per-method estimated stems/metrics are retained under 
 ## Research order
 
 Do not tune the classifiers until separation achieves low reconstruction and S1/S2 leakage, strong murmur-region preservation, stable negative controls, plausible timing, and credible synthetic source metrics. See `docs/separation_pipeline_audit.md` for the baseline audit and affected functions.
+
+The frozen 59-segment quality-gated evaluation currently fails separation
+acceptance (27/36 present candidates accepted and 6/15 absent negative controls
+clear). Treat the generated candidates as audit artifacts, not validated murmur
+sources; the detailed synthetic-to-real decision is recorded in the audit doc.
