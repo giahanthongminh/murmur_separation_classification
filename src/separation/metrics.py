@@ -327,6 +327,8 @@ def _psd_morphology(
             "psd_peak_separation_hz": 0.0,
             "psd_primary_q_factor": 0.0,
             "psd_energy_concentration": 0.0,
+            "psd_low_frequency_limit_95_hz": 0.0,
+            "psd_high_frequency_limit_95_hz": 0.0,
         }
     normalized = band_psd / (float(np.max(band_psd)) + EPSILON)
     distance = max(1, int(round(40.0 / max(resolution, EPSILON))))
@@ -353,6 +355,19 @@ def _psd_morphology(
         right_index = primary + 1
     concentration = float(
         np.sum(band_psd[left_index:right_index]) / (np.sum(band_psd) + EPSILON)
+    )
+    cumulative_energy = np.cumsum(band_psd)
+    cumulative_energy /= cumulative_energy[-1] + EPSILON
+    low_frequency_limit = float(
+        band_frequencies[int(np.searchsorted(cumulative_energy, 0.025))]
+    )
+    high_frequency_limit = float(
+        band_frequencies[
+            min(
+                len(band_frequencies) - 1,
+                int(np.searchsorted(cumulative_energy, 0.975)),
+            )
+        ]
     )
     secondary_frequency = 0.0
     secondary_ratio = 0.0
@@ -386,6 +401,8 @@ def _psd_morphology(
         "psd_peak_separation_hz": float(separation),
         "psd_primary_q_factor": float(q_factor),
         "psd_energy_concentration": concentration,
+        "psd_low_frequency_limit_95_hz": low_frequency_limit,
+        "psd_high_frequency_limit_95_hz": high_frequency_limit,
     }
 
 
@@ -491,6 +508,7 @@ def murmur_observation_features(
             "psd_400_800_hz_ratio": 0.0,
             "psd_800_1000_hz_ratio": 0.0,
             "psd_above_1000_hz_ratio": 0.0,
+            "psd_above_200_hz_ratio": 0.0,
             "time_frequency_peak_hz": 0.0,
             "time_frequency_peak_seconds": 0.0,
             "time_frequency_frame_count": 0.0,
@@ -612,6 +630,7 @@ def murmur_observation_features(
         "psd_400_800_hz_ratio": band_ratio(400, 800),
         "psd_800_1000_hz_ratio": band_ratio(800, 1000),
         "psd_above_1000_hz_ratio": band_ratio(1000, None),
+        "psd_above_200_hz_ratio": band_ratio(200, None),
         "time_frequency_peak_hz": peak_frequency,
         "time_frequency_peak_seconds": peak_seconds,
         "time_frequency_frame_count": float(tf_power.shape[1]),
@@ -769,6 +788,8 @@ def real_proxy_metrics(
         np.linalg.norm(np.asarray(original) - reconstructed)
         / (np.linalg.norm(original) + EPSILON)
     )
+    s1_reference_peak_abs: float | None = None
+    s2_reference_peak_abs: float | None = None
     if phase_masks is None:
         timing_candidate = np.asarray(murmur_candidate)
         murmur_region_energy_retention = energy(murmur_candidate) / (
@@ -788,6 +809,8 @@ def real_proxy_metrics(
         target_mask = systole_mask if target_phase == "systole" else diastole_mask
         candidate_values = np.asarray(murmur_candidate)
         original_values = np.asarray(original)
+        s1_reference_peak_abs = float(np.max(np.abs(original_values[s1_mask])))
+        s2_reference_peak_abs = float(np.max(np.abs(original_values[s2_mask])))
         timing_candidate = candidate_values[target_mask]
         s1_leakage_ratio = energy(candidate_values[s1_mask]) / (
             energy(original_values[s1_mask]) + EPSILON
@@ -821,6 +844,21 @@ def real_proxy_metrics(
         observation_candidate = timing_candidate[int(onset) : int(offset)]
     else:
         observation_candidate = timing_candidate
+    murmur_observation_peak_abs = (
+        float(np.max(np.abs(observation_candidate)))
+        if observation_candidate.size
+        else 0.0
+    )
+    if s1_reference_peak_abs is None or s2_reference_peak_abs is None:
+        s1_s2_reference_peak_abs = None
+        murmur_peak_relative_to_s1_s2_ratio = None
+    else:
+        s1_s2_reference_peak_abs = 0.5 * (
+            s1_reference_peak_abs + s2_reference_peak_abs
+        )
+        murmur_peak_relative_to_s1_s2_ratio = murmur_observation_peak_abs / (
+            s1_s2_reference_peak_abs + EPSILON
+        )
     observation = murmur_observation_features(observation_candidate, sample_rate)
     robustness = boundary_robustness_metrics(
         timing_candidate,
@@ -838,6 +876,22 @@ def real_proxy_metrics(
         "systole_candidate_energy_ratio": systole_candidate_energy_ratio,
         "diastole_candidate_energy_ratio": diastole_candidate_energy_ratio,
         "murmur_phase": target_phase,
+        "murmur_duration_target_phase_percent": (
+            None
+            if timing["duration_ratio"] is None
+            else 100.0 * float(timing["duration_ratio"])
+        ),
+        "s1_reference_peak_abs": s1_reference_peak_abs,
+        "s2_reference_peak_abs": s2_reference_peak_abs,
+        "s1_s2_reference_peak_abs": s1_s2_reference_peak_abs,
+        "murmur_peak_relative_to_s1_s2_ratio": (
+            murmur_peak_relative_to_s1_s2_ratio
+        ),
+        "murmur_peak_relative_to_s1_s2_percent": (
+            None
+            if murmur_peak_relative_to_s1_s2_ratio is None
+            else 100.0 * murmur_peak_relative_to_s1_s2_ratio
+        ),
         "noise_energy_ratio": energy(noise_candidate) / (original_energy + EPSILON),
         "residual_spectral_centroid": spectral["spectral_centroid"],
         "residual_bandwidth": spectral["spectral_bandwidth"],

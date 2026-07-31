@@ -83,10 +83,13 @@ a different method, output profile, scope, or separation configuration.
 The audit exports `murmur_observations_<run>.csv` only from location-aware
 `Present` recordings whose candidates pass the quality gate. It includes
 normalized and absolute onset/offset, amplitude envelope and RMS statistics,
+peak amplitude relative to the mean original S1/S2 peak and duration as a
+percentage of the target phase,
 rule-based envelope shape (constant, crescendo, decrescendo, central peak, or
 multi-peak), rise/decay and burst measurements, dominant frequency and spectral
-shape, PSD peak count/width/concentration, and the dominant-frequency
-trajectory through time. The grouped numeric means and medians are written to
+shape, PSD peak count/width/concentration, central 95% energy frequency range,
+energy above 200 Hz, and the dominant-frequency trajectory through time. The
+grouped numeric means and medians are written to
 `murmur_observation_summary_<run>.csv`; morphology-category counts and ratios
 are written to `murmur_morphology_summary_<run>.csv`. Morlet-wavelet
 time-frequency concentration and ±10 ms onset/offset perturbation stability are
@@ -98,6 +101,13 @@ candidate, not clean-source ground truth. Amplitude is relative to each WAV's
 digital full scale and should not be interpreted as calibrated sound pressure
 or compared clinically across recording devices. The morphology labels are
 reproducible descriptive rules, not diagnoses or classifier ground truth.
+
+The per-cycle `diagnostic_plot.png` uses the same compact layout for systolic
+and diastolic candidates: phase-labelled phonocardiogram, normal-heart estimate,
+murmur waveform plus envelope and onset/offset, S1/S2-relative amplitude, PSD,
+spectrogram, wavelet scalogram, and a concise observation/audit summary. Internal
+noise and SSA-assignment diagnostics remain available as arrays, CSV, JSON, and
+metrics rather than occupying the clinical observation figure.
 
 Phase-aware candidates are tuned by the full-cycle synthetic ground-truth grid
 rather than the real audit set. Run

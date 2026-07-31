@@ -305,6 +305,9 @@ def test_murmur_observation_features_capture_tone_and_amplitude() -> None:
     assert features["amplitude_rms"] == pytest.approx(0.4 / np.sqrt(2), rel=0.03)
     assert features["psd_peak_frequency_hz"] == pytest.approx(180, abs=10)
     assert features["psd_100_200_hz_ratio"] > 0.9
+    assert features["psd_above_200_hz_ratio"] < 0.1
+    assert features["psd_low_frequency_limit_95_hz"] < 180
+    assert features["psd_high_frequency_limit_95_hz"] > 180
     assert features["time_frequency_peak_hz"] == pytest.approx(180, abs=20)
     assert features["time_frequency_frame_count"] > 1
     assert features["time_frequency_frequency_resolution_hz"] > 0
@@ -414,6 +417,8 @@ def test_full_cycle_proxy_metrics_compute_phase_leakage() -> None:
         0.5**2 + 0.25**2 + 0.2**2 + 0.1**2
     )
     assert metrics["outside_murmur_energy_ratio"] == pytest.approx(expected_outside)
+    assert metrics["murmur_peak_relative_to_s1_s2_percent"] == pytest.approx(25.0)
+    assert 0 < metrics["murmur_duration_target_phase_percent"] <= 100
     assert metrics["onset_normalized"] is not None
     assert metrics["offset_normalized"] is not None
 
@@ -448,6 +453,7 @@ def test_full_cycle_proxy_metrics_can_target_diastole() -> None:
     assert metrics["murmur_region_energy_retention"] == pytest.approx(0.25)
     assert metrics["diastole_candidate_energy_ratio"] == pytest.approx(0.25)
     assert metrics["systole_candidate_energy_ratio"] == pytest.approx(0.01)
+    assert metrics["murmur_peak_relative_to_s1_s2_percent"] == pytest.approx(50.0)
 
 
 def test_boundary_robustness_is_stable_for_stationary_tone() -> None:

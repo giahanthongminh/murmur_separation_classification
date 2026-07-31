@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.io import wavfile
-from scipy.signal import hilbert, resample_poly, spectrogram
+from scipy.signal import hilbert, resample_poly, spectrogram, welch
 
 from config import (
     ANNOTATION_BOUNDARY_TOLERANCE_SECONDS,
@@ -52,6 +52,7 @@ OBSERVATION_METRICS = [
     "murmur_onset_systole_seconds",
     "murmur_offset_systole_seconds",
     "murmur_duration_seconds",
+    "murmur_duration_target_phase_percent",
     "murmur_onset_cycle_seconds",
     "murmur_offset_cycle_seconds",
     "murmur_onset_recording_seconds",
@@ -62,6 +63,11 @@ OBSERVATION_METRICS = [
     "amplitude_envelope_peak",
     "amplitude_envelope_mean",
     "amplitude_crest_factor",
+    "s1_reference_peak_abs",
+    "s2_reference_peak_abs",
+    "s1_s2_reference_peak_abs",
+    "murmur_peak_relative_to_s1_s2_ratio",
+    "murmur_peak_relative_to_s1_s2_percent",
     "envelope_shape",
     "envelope_time_to_peak_ratio",
     "envelope_rise_time_seconds",
@@ -88,6 +94,7 @@ OBSERVATION_METRICS = [
     "psd_400_800_hz_ratio",
     "psd_800_1000_hz_ratio",
     "psd_above_1000_hz_ratio",
+    "psd_above_200_hz_ratio",
     "psd_morphology",
     "psd_primary_peak_frequency_hz",
     "psd_prominent_peak_count",
@@ -98,6 +105,8 @@ OBSERVATION_METRICS = [
     "psd_peak_separation_hz",
     "psd_primary_q_factor",
     "psd_energy_concentration",
+    "psd_low_frequency_limit_95_hz",
+    "psd_high_frequency_limit_95_hz",
     "time_frequency_peak_hz",
     "time_frequency_peak_seconds",
     "time_frequency_peak_cycle_seconds",
@@ -747,6 +756,8 @@ def _write_diagnostic_plot(
     sample_rate: int,
     metadata: dict[str, Any],
 ) -> None:
+    """Write one compact, paper-aligned observation figure for either phase."""
+
     time = np.arange(len(result.original)) / sample_rate
     onset_seconds = result.metrics.get("murmur_onset_cycle_seconds")
     offset_seconds = result.metrics.get("murmur_offset_cycle_seconds")
@@ -765,52 +776,66 @@ def _write_diagnostic_plot(
     observation_candidate = result.murmur_candidate[
         observation_start:observation_end
     ]
-    figure, axes = plt.subplots(6, 2, figsize=(15, 22))
+    phase = str(metadata.get("murmur_phase", "target phase"))
+    figure, axes = plt.subplots(4, 2, figsize=(15, 16))
     axes = axes.ravel()
-    axes[0].plot(time, result.original, linewidth=0.7)
-    axes[0].set_title("Original complete cardiac-cycle context")
-    axes[1].plot(time, result.original, linewidth=0.7)
+    figure.suptitle(
+        f"{metadata['recording_id']} - {phase.title()} murmur observation",
+        fontsize=15,
+    )
+
     phase_colors = {
         "s1": "tab:green",
         "systole": "tab:blue",
         "s2": "tab:orange",
         "diastole": "tab:purple",
     }
+    axes[0].plot(time, result.original, linewidth=0.7, color="tab:blue")
     for phase, color in phase_colors.items():
         start = metadata[f"{phase}_relative_start_sample"] / sample_rate
         end = metadata[f"{phase}_relative_end_sample"] / sample_rate
-        axes[1].axvspan(start, end, alpha=0.18, color=color, label=phase)
-    axes[1].legend(loc="upper right")
-    axes[1].set_title("TSV cardiac phases")
-    axes[2].plot(time, result.normal_estimate, linewidth=0.7)
-    axes[2].set_title("Normal-heart estimate")
-    axes[3].plot(time, result.murmur_candidate, linewidth=0.7)
-    axes[3].set_title(
-        f"{metadata.get('murmur_phase', 'target-phase').title()} murmur candidate"
-    )
-    axes[4].plot(time, result.noise_candidate, linewidth=0.7)
-    axes[4].set_title("Noise/artifact candidate")
-    axes[5].plot(
+        axes[0].axvspan(start, end, alpha=0.16, color=color, label=phase)
+    if onset_seconds is not None and offset_seconds is not None:
+        axes[0].axvline(float(onset_seconds), color="tab:red", linestyle="--")
+        axes[0].axvline(float(offset_seconds), color="tab:red", linestyle="--")
+    axes[0].legend(loc="upper right", fontsize=8, ncol=4)
+    axes[0].set_title("Original phonocardiogram with cardiac phases")
+
+    axes[1].plot(
         time,
-        np.abs(hilbert(result.murmur_candidate)),
+        result.original,
         linewidth=0.6,
-        alpha=0.45,
-        label="raw Hilbert envelope",
+        color="0.65",
+        alpha=0.65,
+        label="original",
+    )
+    axes[1].plot(
+        time,
+        result.normal_estimate,
+        linewidth=0.8,
+        color="tab:blue",
+        label="normal-heart estimate",
+    )
+    axes[1].legend(loc="upper right", fontsize=8)
+    axes[1].set_title("Separation check: original vs normal-heart estimate")
+
+    axes[2].plot(
+        time, result.murmur_candidate, linewidth=0.65, label="murmur candidate"
     )
     observation_time = (
         np.arange(len(observation_candidate)) + observation_start
     ) / sample_rate
     smooth_envelope = smooth_amplitude_envelope(observation_candidate, sample_rate)
-    axes[5].plot(
+    axes[2].plot(
         observation_time,
         smooth_envelope,
         color="tab:red",
         linewidth=1.5,
-        label="smoothed detected interval",
+        label="smoothed envelope",
     )
     if len(smooth_envelope):
         peak_index = int(np.argmax(smooth_envelope))
-        axes[5].scatter(
+        axes[2].scatter(
             observation_time[peak_index],
             smooth_envelope[peak_index],
             color="black",
@@ -818,20 +843,60 @@ def _write_diagnostic_plot(
             zorder=3,
             label="envelope peak",
         )
-    axes[5].set_title(
-        "Amplitude envelope — "
+    axes[2].set_title(
+        f"{metadata.get('murmur_phase', 'Target-phase').title()} murmur and "
+        "amplitude envelope - "
         f"{result.metrics.get('envelope_shape', 'not characterized')}"
     )
-    axes[5].legend(loc="upper right", fontsize=8)
+    axes[2].legend(loc="upper right", fontsize=8)
     if onset_seconds is not None and offset_seconds is not None:
-        for axis in (axes[3], axes[5]):
-            axis.axvline(float(onset_seconds), color="tab:red", linestyle="--")
-            axis.axvline(float(offset_seconds), color="tab:red", linestyle="--")
-    axes[6].psd(
-        observation_candidate,
-        Fs=sample_rate,
-        NFFT=min(512, len(observation_candidate)),
+        axes[2].axvline(float(onset_seconds), color="tab:red", linestyle="--")
+        axes[2].axvline(float(offset_seconds), color="tab:red", linestyle="--")
+
+    amplitude_values = [
+        float(result.metrics.get("s1_reference_peak_abs", 0.0) or 0.0),
+        float(result.metrics.get("s2_reference_peak_abs", 0.0) or 0.0),
+        float(result.metrics.get("amplitude_peak_abs", 0.0) or 0.0),
+    ]
+    bars = axes[3].bar(
+        ["S1 original", "S2 original", "Murmur candidate"],
+        amplitude_values,
+        color=["tab:green", "tab:orange", "tab:red"],
     )
+    for bar, value in zip(bars, amplitude_values):
+        axes[3].text(
+            bar.get_x() + bar.get_width() / 2,
+            value,
+            f"{value:.3g}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    relative_percent = result.metrics.get(
+        "murmur_peak_relative_to_s1_s2_percent"
+    )
+    relative_text = (
+        "unavailable"
+        if relative_percent is None
+        else f"{float(relative_percent):.1f}% of mean S1/S2 peak"
+    )
+    axes[3].set_title(f"Paper-aligned relative amplitude - {relative_text}")
+    axes[3].set_ylabel("relative digital amplitude")
+
+    if len(observation_candidate) > 1:
+        psd_frequencies, psd_power = welch(
+            observation_candidate,
+            fs=sample_rate,
+            nperseg=min(512, len(observation_candidate)),
+            detrend="constant",
+        )
+        axes[4].plot(
+            psd_frequencies,
+            10 * np.log10(psd_power + 1e-12),
+            linewidth=1.0,
+        )
+    else:
+        axes[4].text(0.5, 0.5, "insufficient interval", ha="center", va="center")
     primary_frequency = float(
         result.metrics.get("psd_primary_peak_frequency_hz", 0.0) or 0.0
     )
@@ -839,7 +904,7 @@ def _write_diagnostic_plot(
         result.metrics.get("psd_secondary_peak_frequency_hz", 0.0) or 0.0
     )
     if primary_frequency > 0:
-        axes[6].axvline(
+        axes[4].axvline(
             primary_frequency,
             color="tab:red",
             linestyle="--",
@@ -847,19 +912,36 @@ def _write_diagnostic_plot(
             label=f"primary {primary_frequency:.0f} Hz",
         )
     if secondary_frequency > 0:
-        axes[6].axvline(
+        axes[4].axvline(
             secondary_frequency,
             color="tab:orange",
             linestyle=":",
             linewidth=1.0,
             label=f"secondary {secondary_frequency:.0f} Hz",
         )
-    axes[6].set_title(
-        "Detected interval PSD — "
+    low_frequency = float(
+        result.metrics.get("psd_low_frequency_limit_95_hz", 0.0) or 0.0
+    )
+    high_frequency = float(
+        result.metrics.get("psd_high_frequency_limit_95_hz", 0.0) or 0.0
+    )
+    if high_frequency > low_frequency > 0:
+        axes[4].axvspan(
+            low_frequency,
+            high_frequency,
+            color="tab:green",
+            alpha=0.12,
+            label=f"95% energy: {low_frequency:.0f}-{high_frequency:.0f} Hz",
+        )
+    axes[4].set_xlim(0, min(1000, sample_rate / 2))
+    axes[4].set_title(
+        "Murmur PSD - "
         f"{result.metrics.get('psd_morphology', 'not characterized')}"
     )
     if primary_frequency > 0:
-        axes[6].legend(loc="upper right", fontsize=8)
+        axes[4].legend(loc="upper right", fontsize=8)
+    axes[4].set_ylabel("power spectral density (dB/Hz)")
+
     frequencies, times, power = spectrogram(
         observation_candidate,
         fs=sample_rate,
@@ -872,7 +954,7 @@ def _write_diagnostic_plot(
             len(observation_candidate) / sample_rate / 2,
             1 / sample_rate,
         )
-        axes[7].imshow(
+        axes[5].imshow(
             power_db,
             origin="lower",
             aspect="auto",
@@ -884,12 +966,12 @@ def _write_diagnostic_plot(
             ),
         )
     else:
-        axes[7].pcolormesh(times, frequencies, power_db, shading="auto")
+        axes[5].pcolormesh(times, frequencies, power_db, shading="auto")
     ridge_times, ridge = dominant_frequency_trajectory(
         observation_candidate, sample_rate
     )
     if len(ridge_times):
-        axes[7].plot(
+        axes[5].plot(
             ridge_times + observation_start / sample_rate,
             ridge,
             color="white",
@@ -898,139 +980,97 @@ def _write_diagnostic_plot(
             markersize=2,
             label="dominant-frequency trajectory",
         )
-        axes[7].legend(loc="upper right", fontsize=8)
-    axes[7].set_ylim(0, min(1000, sample_rate / 2))
-    axes[7].set_title(
-        "Detected interval spectrogram — frequency "
+        axes[5].legend(loc="upper right", fontsize=8)
+    axes[5].set_ylim(0, min(1000, sample_rate / 2))
+    axes[5].set_title(
+        "Murmur spectrogram - frequency "
         f"{result.metrics.get('time_frequency_ridge_direction', 'not characterized')}"
     )
     wavelet_times, wavelet_frequencies, wavelet_power, wavelet_status = (
         wavelet_scalogram(observation_candidate, sample_rate)
     )
     if wavelet_power.size:
-        axes[8].pcolormesh(
+        axes[6].pcolormesh(
             wavelet_times + observation_start / sample_rate,
             wavelet_frequencies,
             10 * np.log10(wavelet_power + 1e-12),
             shading="auto",
         )
-        axes[8].set_ylim(20, min(1000, sample_rate / 2))
-        axes[8].set_title("Detected interval Morlet wavelet scalogram")
+        axes[6].set_ylim(20, min(1000, sample_rate / 2))
+        axes[6].set_title("Murmur Morlet wavelet scalogram")
     else:
-        axes[8].text(0.5, 0.5, wavelet_status, ha="center", va="center")
-        axes[8].set_title("Wavelet scalogram unavailable")
-    axes[8].set_xlabel("seconds")
-    axes[8].set_ylabel("frequency (Hz)")
-    assignments = result.assignments
-    axes[9].bar(
-        [row["component_index"] for row in result.component_features],
-        [row["relative_energy"] for row in result.component_features],
-        color=[
-            "tab:green"
-            if row["assignment"] == "normal"
-            else "tab:red"
-            if row["assignment"] == "murmur_candidate"
-            else "tab:gray"
-            for row in result.component_features
-        ],
-    )
-    axes[9].set_title("SSA component energy and assignment")
-    axes[9].set_xlabel("component")
-    axes[10].axis("off")
-    metric_lines = [
-        f"{key}: {value:.5g}" if isinstance(value, float) else f"{key}: {value}"
-        for key, value in result.metrics.items()
-        if key
-        in {
-            "reconstruction_error",
-            "normal_residual_correlation",
-            "murmur_region_energy_retention",
-            "s1_leakage_ratio",
-            "s2_leakage_ratio",
-            "outside_murmur_energy_ratio",
-            "noise_energy_ratio",
-            "onset_normalized",
-            "offset_normalized",
-            "selection_score",
-            "phase_selected_component_count",
-            "phase_rejected_component_count",
-            "phase_selection_used_fallback",
-            "phase_threshold_scope",
-            "candidate_quality_status",
-            "timing_quality_status",
-            "murmur_onset_recording_seconds",
-            "murmur_offset_recording_seconds",
-            "envelope_shape",
-            "envelope_time_to_peak_ratio",
-            "active_burst_count",
-            "active_time_ratio",
-            "psd_morphology",
-            "psd_primary_peak_frequency_hz",
-            "psd_primary_peak_width_hz",
-            "psd_prominent_peak_count",
-            "time_frequency_ridge_direction",
-            "time_frequency_ridge_slope_hz_per_second",
-            "time_frequency_ridge_variability_hz",
-            "wavelet_peak_frequency_hz",
-            "wavelet_entropy",
-            "boundary_stability_status",
-            "boundary_amplitude_rms_relative_range",
-            "boundary_psd_peak_frequency_range_hz",
-            "predicted_timing_label",
-            "predicted_shape_label",
-            "timing_label_agreement",
-            "shape_label_agreement",
-        }
-    ]
-    def preview(indexes: list[int]) -> str:
-        suffix = "..." if len(indexes) > 12 else ""
-        return f"{indexes[:12]}{suffix}"
+        axes[6].text(0.5, 0.5, wavelet_status, ha="center", va="center")
+        axes[6].set_title("Wavelet scalogram unavailable")
 
-    axes[10].text(
+    def format_metric(name: str, digits: int = 3) -> str:
+        value = result.metrics.get(name)
+        if value is None:
+            return "NA"
+        if isinstance(value, (float, np.floating)):
+            return f"{float(value):.{digits}g}"
+        return str(value)
+
+    axes[7].axis("off")
+    axes[7].text(
         0,
         1,
         "\n".join(
             [
-                metadata["recording_id"],
-                f"method: {result.selected_method}",
-                f"normal components: {preview(assignments['normal'])}",
-                f"murmur components: {preview(assignments['murmur_candidate'])}",
-                f"noise components: {preview(assignments['noise_artifact'])}",
-                *metric_lines,
-            ]
-        ),
-        va="top",
-        family="monospace",
-        fontsize=9,
-    )
-    axes[11].axis("off")
-    axes[11].text(
-        0,
-        1,
-        "\n".join(
-            [
-                "CirCor expert reference",
-                f"murmur phase: {metadata.get('murmur_phase')}",
-                f"phase label: {metadata.get('murmur_label')}",
-                f"timing: {metadata.get('expert_timing_label')}",
-                f"shape: {metadata.get('expert_shape_label')}",
-                f"pitch: {metadata.get('expert_pitch_label')}",
-                f"grade: {metadata.get('expert_grading_label')}",
-                f"quality: {metadata.get('expert_quality_label')}",
+                "Observation summary",
+                f"method / quality: {result.selected_method} / "
+                f"{format_metric('candidate_quality_status')}",
+                f"phase / timing quality: {metadata.get('murmur_phase')} / "
+                f"{format_metric('timing_quality_status')}",
+                f"onset-offset (recording s): "
+                f"{format_metric('murmur_onset_recording_seconds', 5)} - "
+                f"{format_metric('murmur_offset_recording_seconds', 5)}",
+                f"duration (% target phase): "
+                f"{format_metric('murmur_duration_target_phase_percent', 4)}",
+                f"amplitude (% mean S1/S2 peak): "
+                f"{format_metric('murmur_peak_relative_to_s1_s2_percent', 4)}",
+                f"envelope: {format_metric('envelope_shape')}",
+                f"PSD: {format_metric('psd_morphology')}; primary "
+                f"{format_metric('psd_primary_peak_frequency_hz', 4)} Hz",
+                f"95% PSD range: {format_metric('psd_low_frequency_limit_95_hz', 4)} - "
+                f"{format_metric('psd_high_frequency_limit_95_hz', 4)} Hz",
+                f"frequency trajectory: "
+                f"{format_metric('time_frequency_ridge_direction')}",
+                f"boundary stability: "
+                f"{format_metric('boundary_stability_status')}",
                 "",
+                "CirCor expert reference",
+                f"timing: {metadata.get('expert_timing_label')} -> "
+                f"{format_metric('predicted_timing_label')}",
+                f"shape: {metadata.get('expert_shape_label')} -> "
+                f"{format_metric('predicted_shape_label')}",
+                f"pitch / grade / quality: {metadata.get('expert_pitch_label')} / "
+                f"{metadata.get('expert_grading_label')} / "
+                f"{metadata.get('expert_quality_label')}",
+                "",
+                "Separation audit",
+                f"outside-target energy: "
+                f"{format_metric('outside_murmur_energy_ratio', 4)}",
+                f"target retention: "
+                f"{format_metric('murmur_region_energy_retention', 4)}",
+                f"S1 / S2 leakage: {format_metric('s1_leakage_ratio', 4)} / "
+                f"{format_metric('s2_leakage_ratio', 4)}",
                 "Expert labels are semantic references,",
                 "not clean-source waveform ground truth.",
             ]
         ),
         va="top",
         family="monospace",
-        fontsize=10,
+        fontsize=9.5,
     )
-    for axis in axes[:6]:
+
+    for axis in axes[:3]:
         axis.set_xlabel("seconds")
-    axes[6].set_xlabel("frequency (Hz)")
-    axes[7].set_xlabel("seconds")
-    figure.tight_layout(pad=1.2)
+    axes[4].set_xlabel("frequency (Hz)")
+    axes[5].set_xlabel("seconds")
+    axes[5].set_ylabel("frequency (Hz)")
+    axes[6].set_xlabel("seconds")
+    axes[6].set_ylabel("frequency (Hz)")
+    figure.tight_layout(rect=(0, 0, 1, 0.97), pad=1.2)
     figure.savefig(destination, dpi=140)
     plt.close(figure)
 

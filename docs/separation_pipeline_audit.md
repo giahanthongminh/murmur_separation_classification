@@ -163,11 +163,14 @@ interval selected from CirCor metadata:
 - onset and offset relative to the target phase, cardiac-cycle context, and the
   original recording;
 - peak, RMS, mean absolute, envelope, and crest-factor amplitude;
+- candidate peak amplitude relative to the mean original S1/S2 peak, following
+  the phono-spectrographic paper's interpretable relative-volume convention;
 - smoothed-envelope shape, time to peak, rise/decay, symmetry, active-burst
   count, and active-duration ratios;
 - dominant frequency, centroid, bandwidth, and spectral entropy;
 - Welch PSD peak count, half-height width, prominence, secondary-peak ratio,
-  peak energy concentration, and energy fractions in six frequency bands;
+  peak energy concentration, central 95% energy frequency limits, energy above
+  200 Hz, and energy fractions in six frequency bands;
 - spectrogram peak time/frequency, time-frequency entropy, spectral flux, and
   the direction, slope, variability, and continuity of its dominant-frequency
   trajectory.
@@ -189,6 +192,24 @@ dominant-frequency trajectory so each exported description can be checked
 against the candidate waveform. `murmur_morphology_summary_<run>.csv` counts
 each envelope, PSD, and frequency-trajectory category within each murmur timing
 label, exposing dataset diversity without averaging categorical descriptions.
+
+The observation figure was simplified after visually reviewing the combined
+phono-spectrogram examples in *Phono-spectrographic analysis of heart murmur in
+children* (BMC Pediatrics 2007;7:23). The shared four-by-two systolic/diastolic
+layout retains the complete phase-labelled phonocardiogram, normal-heart
+estimate, murmur waveform/envelope, S1/S2-relative amplitude, PSD, spectrogram,
+wavelet scalogram, and concise expert/audit interpretation. The separate raw
+original panel, noise trace, SSA component bar chart, and long internal metric
+dump were removed from this observation figure because they duplicated context
+or served algorithm debugging rather than murmur interpretation. Their source
+arrays, component table, assignments, and metrics are still preserved.
+
+This is paper-aligned rather than an exact reproduction. The paper manually
+averaged three beats, used its own recording/filter/display calibration, and
+reported a manually read high-frequency limit. This pipeline automatically
+measures each separated candidate, reports the central 95% PSD-energy range,
+and keeps the paper's 200 Hz and 80% duration values descriptive only; they are
+not imported as diagnostic or classification thresholds for CirCor.
 
 ## Systolic/diastolic observation extension
 
