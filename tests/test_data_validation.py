@@ -78,3 +78,16 @@ def test_valid_fixture_passes(tmp_path: Path) -> None:
         paths, expected_recordings=2, expected_patients=2, strict=True
     )
     assert report["valid"] is True
+
+
+def test_version_1_0_3_recording_locations_column_is_supported(tmp_path: Path) -> None:
+    paths = _dataset(tmp_path)
+    metadata = pd.read_csv(paths.metadata_path).rename(
+        columns={"Locations": "Recording locations:"}
+    )
+    metadata.to_csv(paths.metadata_path, index=False)
+    report = validate_dataset(
+        paths, expected_recordings=1, expected_patients=1, strict=True
+    )
+    assert report["valid"] is True
+    assert report["metadata_location_column"] == "Recording locations:"

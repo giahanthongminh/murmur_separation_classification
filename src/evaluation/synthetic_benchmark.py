@@ -41,6 +41,7 @@ MURMUR_SHAPES = (
     "crescendo_decrescendo",
     "plateau",
 )
+TARGET_PHASES = ("systole", "diastole")
 PHASE_ORDER = ("s1", "systole", "s2", "diastole")
 PHASE_FRACTIONS = (0.15, 0.35, 0.15, 0.35)
 PHASE_FOCUS_GRID = (0.06, 0.08, 0.12, 0.16)
@@ -54,13 +55,29 @@ def _smooth_gate(time: np.ndarray, start: float, end: float, ramp: float = 0.025
     return np.minimum(rise, fall)
 
 
+def _shape_for_target_phase(shape: str, target_phase: str) -> str:
+    if target_phase not in TARGET_PHASES:
+        raise ValueError(f"target_phase must be one of {TARGET_PHASES}")
+    if shape.endswith("_systolic"):
+        return shape.removesuffix("_systolic") + f"_{target_phase[:-1]}ic"
+    if shape.endswith("_diastolic"):
+        return shape.removesuffix("_diastolic") + f"_{target_phase[:-1]}ic"
+    if shape == "holosystolic" or shape == "holodiastolic":
+        return "holosystolic" if target_phase == "systole" else "holodiastolic"
+    return shape
+
+
 def _murmur_envelope(shape: str, time: np.ndarray) -> tuple[np.ndarray, float, float]:
     duration = float(time[-1] + (time[1] - time[0]))
     windows = {
         "early_systolic": (0.08 * duration, 0.42 * duration),
+        "early_diastolic": (0.08 * duration, 0.42 * duration),
         "mid_systolic": (0.30 * duration, 0.70 * duration),
+        "mid_diastolic": (0.30 * duration, 0.70 * duration),
         "late_systolic": (0.58 * duration, 0.92 * duration),
+        "late_diastolic": (0.58 * duration, 0.92 * duration),
         "holosystolic": (0.06 * duration, 0.94 * duration),
+        "holodiastolic": (0.06 * duration, 0.94 * duration),
         "crescendo": (0.08 * duration, 0.92 * duration),
         "decrescendo": (0.08 * duration, 0.92 * duration),
         "crescendo_decrescendo": (0.08 * duration, 0.92 * duration),
@@ -101,13 +118,17 @@ def make_synthetic_mixture(
     murmur_to_heart_db: float,
     snr_db: float,
     seed: int,
+    target_phase: str = "systole",
 ) -> dict[str, object]:
+    if target_phase not in TARGET_PHASES:
+        raise ValueError(f"target_phase must be one of {TARGET_PHASES}")
+    shape = _shape_for_target_phase(shape, target_phase)
     rng = np.random.default_rng(seed)
     samples = int(round(sample_rate * duration))
     time = np.arange(samples) / sample_rate
     phase_masks = _synthetic_phase_masks(samples)
     s1_times = time[phase_masks["s1"]]
-    systole_times = time[phase_masks["systole"]]
+    target_times = time[phase_masks[target_phase]]
     s2_times = time[phase_masks["s2"]]
     s1_center = float(np.mean(s1_times))
     s2_center = float(np.mean(s2_times))
@@ -120,17 +141,17 @@ def make_synthetic_mixture(
         * np.sin(2 * np.pi * 72 * time)
         + 0.05 * np.sin(2 * np.pi * 25 * time)
     )
-    local_systole_time = systole_times - systole_times[0]
+    local_target_time = target_times - target_times[0]
     if shape == "absent":
-        local_envelope = np.zeros(len(local_systole_time))
+        local_envelope = np.zeros(len(local_target_time))
         onset = None
         offset = None
     else:
         local_envelope, onset, offset = _murmur_envelope(
-            shape, local_systole_time
+            shape, local_target_time
         )
     envelope = np.zeros(samples)
-    envelope[phase_masks["systole"]] = local_envelope
+    envelope[phase_masks[target_phase]] = local_envelope
     carrier = (
         np.sin(2 * np.pi * 180 * time + rng.uniform(0, 2 * np.pi))
         + 0.55 * np.sin(2 * np.pi * 260 * time + rng.uniform(0, 2 * np.pi))
@@ -154,6 +175,8 @@ def make_synthetic_mixture(
         "onset_seconds": onset,
         "offset_seconds": offset,
         "murmur_present": shape != "absent",
+        "target_phase": target_phase,
+        "shape": shape,
         "phase_masks": phase_masks,
     }
 
@@ -175,10 +198,11 @@ def _evaluate(
     phase_masks = sample["phase_masks"]
     if not isinstance(phase_masks, dict):
         raise TypeError("synthetic phase_masks must be a dictionary")
-    systole_mask = np.asarray(phase_masks["systole"], dtype=bool)
-    systolic_estimate = estimate_murmur[systole_mask]
+    target_phase = str(sample.get("target_phase", "systole"))
+    target_mask = np.asarray(phase_masks[target_phase], dtype=bool)
+    target_estimate = estimate_murmur[target_mask]
     activity = detect_activity_interval(
-        systolic_estimate,
+        target_estimate,
         sample_rate,
         threshold_mad=1.5,
         minimum_duration_ms=15,
@@ -186,7 +210,7 @@ def _evaluate(
     )
     onset = activity["onset_normalized"]
     offset = activity["offset_normalized"]
-    duration = int(systole_mask.sum()) / sample_rate
+    duration = int(target_mask.sum()) / sample_rate
     murmur_present = bool(sample["murmur_present"])
     onset_error = (
         None
@@ -198,13 +222,14 @@ def _evaluate(
         if offset is None or not murmur_present
         else 1000 * abs(float(offset) * duration - float(sample["offset_seconds"]))
     )
-    true_envelope = np.abs(hilbert(true_murmur[systole_mask]))
-    estimated_envelope = np.abs(hilbert(systolic_estimate))
+    true_envelope = np.abs(hilbert(true_murmur[target_mask]))
+    estimated_envelope = np.abs(hilbert(target_estimate))
     candidate_energy_ratio = energy(estimate_murmur) / (
         energy(np.asarray(sample["mixture"])) + EPSILON
     )
     return {
         "murmur_present": murmur_present,
+        "target_phase": target_phase,
         "si_sdr_murmur": (
             si_sdr(true_murmur, estimate_murmur) if murmur_present else None
         ),
@@ -272,8 +297,11 @@ def run_benchmark(
     seeds: tuple[int, ...] = (42, 43),
     sample_rate: int = 1000,
     duration: float = 0.8,
+    target_phase: str = "systole",
     base_config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
 ) -> pd.DataFrame:
+    if target_phase not in TARGET_PHASES:
+        raise ValueError(f"target_phase must be one of {TARGET_PHASES}")
     ensure_output_directories()
     config = replace(
         base_config,
@@ -306,16 +334,18 @@ def run_benchmark(
     for shape, ratio, noise_level, seed in product(
         shapes, murmur_to_heart_db, snr_db, seeds
     ):
+        phase_shape = _shape_for_target_phase(shape, target_phase)
         sample = make_synthetic_mixture(
-            shape,
+            phase_shape,
             sample_rate=sample_rate,
             duration=duration,
             murmur_to_heart_db=ratio,
             snr_db=noise_level,
             seed=seed,
+            target_phase=target_phase,
         )
         sample_id = (
-            f"{shape}_mhr_{ratio:+g}_snr_{noise_level:g}_seed_{seed}"
+            f"{target_phase}_{phase_shape}_mhr_{ratio:+g}_snr_{noise_level:g}_seed_{seed}"
             .replace("+", "plus")
             .replace("-", "minus")
             .replace(".", "p")
@@ -345,10 +375,12 @@ def run_benchmark(
                 config=method_config,
                 method=method,
                 phase_masks=phase_masks,
+                target_phase=target_phase,
             )
             metrics = _evaluate(sample, result, sample_rate)
             row = {
-                "shape": shape,
+                "shape": phase_shape,
+                "target_phase": target_phase,
                 "murmur_to_heart_db": ratio,
                 "snr_db": noise_level,
                 "seed": seed,
@@ -425,28 +457,33 @@ def run_phase_threshold_tuning(
     ssa_window_ms: tuple[float, ...] = SSA_WINDOW_MS_GRID,
     sample_rate: int = 1000,
     duration: float = 0.8,
+    target_phase: str = "systole",
     base_config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Tune phase selection on full-cycle mixtures with known source stems."""
 
+    if target_phase not in TARGET_PHASES:
+        raise ValueError(f"target_phase must be one of {TARGET_PHASES}")
     ensure_output_directories()
     samples: list[tuple[str, float, float, int, dict[str, object]]] = []
     for shape, ratio, noise_level, seed in product(
         shapes, murmur_to_heart_db, snr_db, seeds
     ):
+        phase_shape = _shape_for_target_phase(shape, target_phase)
         samples.append(
             (
-                shape,
+                phase_shape,
                 ratio,
                 noise_level,
                 seed,
                 make_synthetic_mixture(
-                    shape,
+                    phase_shape,
                     sample_rate=sample_rate,
                     duration=duration,
                     murmur_to_heart_db=ratio,
                     snr_db=noise_level,
                     seed=seed,
+                    target_phase=target_phase,
                 ),
             )
         )
@@ -464,6 +501,7 @@ def run_phase_threshold_tuning(
                     murmur_to_heart_db=0.0,
                     snr_db=noise_level,
                     seed=seed,
+                    target_phase=target_phase,
                 ),
             )
         )
@@ -493,10 +531,12 @@ def run_phase_threshold_tuning(
                 config=method_config,
                 method="zcr",
                 phase_masks=phase_masks,
+                target_phase=target_phase,
             )
             rows.append(
                 {
                     "shape": shape,
+                    "target_phase": target_phase,
                     "murmur_to_heart_db": ratio,
                     "snr_db": noise_level,
                     "seed": seed,
@@ -545,14 +585,21 @@ def run_phase_threshold_tuning(
         )
     summary = pd.DataFrame(summary_rows)
     selected = _select_tuning_configuration(summary)
+    selected["target_phase"] = target_phase
     selected["ssa_window_length_at_production_rate"] = int(
         round(float(selected["ssa_window_ms"]) * base_config.sample_rate / 1000)
     )
-    frame.to_csv(REPORT_OUTPUT_DIR / "phase_threshold_tuning.csv", index=False)
-    summary.to_csv(
-        REPORT_OUTPUT_DIR / "phase_threshold_tuning_summary.csv", index=False
+    suffix = "" if target_phase == "systole" else f"_{target_phase}"
+    frame.to_csv(
+        REPORT_OUTPUT_DIR / f"phase_threshold_tuning{suffix}.csv", index=False
     )
-    (REPORT_OUTPUT_DIR / "phase_threshold_tuning_selected.json").write_text(
+    summary.to_csv(
+        REPORT_OUTPUT_DIR / f"phase_threshold_tuning_summary{suffix}.csv",
+        index=False,
+    )
+    (
+        REPORT_OUTPUT_DIR / f"phase_threshold_tuning_selected{suffix}.json"
+    ).write_text(
         json.dumps(selected, indent=2), encoding="utf-8"
     )
     return frame, summary, selected
@@ -565,6 +612,12 @@ def main(argv: list[str] | None = None) -> int:
         "--tune-phase-thresholds",
         action="store_true",
         help="Tune full-cycle phase thresholds using present and absent ground truth",
+    )
+    parser.add_argument(
+        "--target-phase",
+        choices=TARGET_PHASES,
+        default="systole",
+        help="Place and score the synthetic murmur in systole or diastole",
     )
     args = parser.parse_args(argv)
     options = {}
@@ -579,7 +632,10 @@ def main(argv: list[str] | None = None) -> int:
                 kurtosis_population_size=10,
                 kurtosis_generations=8,
             ),
+            "target_phase": args.target_phase,
         }
+    else:
+        options["target_phase"] = args.target_phase
     if args.tune_phase_thresholds:
         tuning_options = {}
         if args.quick:
@@ -588,12 +644,18 @@ def main(argv: list[str] | None = None) -> int:
                 "murmur_to_heart_db": (-3.0,),
                 "snr_db": (20.0,),
                 "seeds": (42, 43),
+                "target_phase": args.target_phase,
             }
+        else:
+            tuning_options["target_phase"] = args.target_phase
         frame, summary, selected = run_phase_threshold_tuning(**tuning_options)
         print(f"Tuning rows: {len(frame)}")
         print(f"Configurations: {len(summary)}")
         print(f"Selected: {json.dumps(selected, sort_keys=True)}")
-        print(f"Report: {REPORT_OUTPUT_DIR / 'phase_threshold_tuning.csv'}")
+        suffix = "" if args.target_phase == "systole" else f"_{args.target_phase}"
+        print(
+            f"Report: {REPORT_OUTPUT_DIR / f'phase_threshold_tuning{suffix}.csv'}"
+        )
         return 0
     frame = run_benchmark(**options)
     print(f"Benchmark rows: {len(frame)}")

@@ -4,7 +4,7 @@ This repository tests whether normal-heart suppression can preserve murmur-relat
 
 ## Pipeline boundary
 
-- Input is restricted to `~/physionet.org/files/circor-heart-sound/1.0.1/training_data/*.wav`.
+- Input is restricted to `~/physionet.org/files/circor-heart-sound/1.0.3/training_data/*.wav`.
 - Patient metadata comes from `training_data.csv`.
 - Generated arrays, audio, figures, configurations, and reports are written only under this repository's ignored `outputs/` directory.
 - Set `CIRCOR_DATASET_ROOT` to override the dataset location.
@@ -19,7 +19,13 @@ pytest -q
 
 Validation checks the 3,163 recordings, 942 patients, filename pairing, readable/non-empty WAVs, sampling rates, TSV states and bounds, duplicate IDs/paths, and metadata recording references. It always writes `outputs/reports/dataset_validation.json`; strict mode exits nonzero when any anomaly is present.
 
-On the audited local snapshot, counts are correct but strict validation intentionally fails: `50782_MV_1.wav` has no exact TSV pair, `50782_MV.tsv` is orphaned and malformed, and five other TSVs contain interval overlap/order errors beyond the allowed 1 ms rounding tolerance. Resolve or explicitly exclude these records before a full experiment. `--skip-dataset-validation` exists only for targeted diagnostic work on already-inspected valid records.
+On the audited v1.0.3 snapshot, all 3,163 WAVs have an exact TSV pair. Strict
+validation still intentionally fails for six unusable annotations:
+`50782_MV_1.tsv` is a six-byte dummy row (`0 0 28`), while `50150_MV`,
+`50690_MV_2`, `50690_TV`, `84851_PV`, and `84930_AV` contain interval
+overlap/order errors beyond the allowed 1 ms rounding tolerance. These records
+are explicitly skipped rather than repaired silently. `--skip-dataset-validation`
+exists only for targeted diagnostic work on already-inspected valid records.
 
 ## Real-data audit
 
@@ -35,33 +41,37 @@ Each selected contiguous S1-systole-S2-diastole cycle is processed separately an
 
 The summary is `outputs/reports/separation_summary.csv`. Use `--energy-threshold` to compare 0.95, 0.975, 0.99, and 0.995. DWT is an opt-in ablation via `--use-dwt`, not an assumed improvement.
 
-Real-audit timing is normalized within the annotated systole. S1 and S2
+Real-audit timing is normalized within the requested murmur phase (systole or
+diastole). S1 and S2
 leakage are candidate energy in each heart-sound phase divided by original
 energy in that phase. Outside-murmur energy is candidate energy outside the
-annotated systole divided by total candidate energy. Use `--run-name` to keep
+target phase divided by total candidate energy. Use `--target-phase auto` to
+follow the CirCor expert phase metadata for Present recordings, or select one
+phase explicitly. Use `--run-name` to keep
 method outputs and reports isolated during direct comparisons.
 
 When cardiac phase masks are available, provisional murmur components are
-filtered by phase-energy density. Components must have sufficient systolic
-focus and systole-to-S1/S2 contrast; rejected full-length components return to
+filtered by phase-energy density. Components must have sufficient target-phase
+focus and target-phase-to-S1/S2 contrast; rejected full-length components return to
 the normal-heart estimate, so reconstruction remains exact and leakage is not
-hidden by zeroing samples outside systole. If no component passes, the most
-systole-focused provisional component is retained and
+hidden by zeroing samples outside the target phase. If no component passes, the
+most target-focused provisional component is retained and
 `phase_selection_used_fallback` is recorded for low-confidence review.
 The audit also writes `candidate_quality_status` and separate all-segment,
 accepted-only, and quality-stratified reports so fallback candidates cannot be
 silently mixed into aggregate separation metrics.
 Use `--disable-phase-aware-selection` for a baseline ablation, or adjust
 `--minimum-systole-focus` and `--minimum-systole-to-s1-s2-ratio` in explicit
-threshold studies. `--disable-phase-selection-fallback` exposes cases where no
+threshold studies (these legacy option names apply to the selected target
+phase). `--disable-phase-selection-fallback` exposes cases where no
 provisional component satisfies the phase criteria.
 
 For a restartable scan of every exact WAV/TSV pair, first run a small pilot and
 then expand the same configuration:
 
 ```bash
-python -m src.separation.audit --all-recordings --limit 20 --cycles-per-recording 3 --method auto --use-dwt --output-profile summary --run-name cssa_auto_dwt_all_recordings_pilot --skip-dataset-validation
-python -m src.separation.audit --all-recordings --limit 0 --cycles-per-recording 3 --method auto --use-dwt --output-profile summary --run-name cssa_auto_dwt_all_recordings --resume --skip-dataset-validation
+python -m src.separation.audit --all-recordings --limit 20 --cycles-per-recording 3 --target-phase auto --method auto --use-dwt --output-profile summary --run-name cssa_auto_dwt_all_recordings_pilot --skip-dataset-validation
+python -m src.separation.audit --all-recordings --limit 0 --cycles-per-recording 3 --target-phase auto --method auto --use-dwt --output-profile summary --run-name cssa_auto_dwt_all_recordings --resume --skip-dataset-validation
 ```
 
 `--limit 0` means all recordings and `--cycles-per-recording 0` means all valid
@@ -78,7 +88,12 @@ multi-peak), rise/decay and burst measurements, dominant frequency and spectral
 shape, PSD peak count/width/concentration, and the dominant-frequency
 trajectory through time. The grouped numeric means and medians are written to
 `murmur_observation_summary_<run>.csv`; morphology-category counts and ratios
-are written to `murmur_morphology_summary_<run>.csv`. These describe an estimated murmur
+are written to `murmur_morphology_summary_<run>.csv`. Morlet-wavelet
+time-frequency concentration and ±10 ms onset/offset perturbation stability are
+included for morphology and robustness review. CirCor timing, shape, pitch,
+grade, and quality labels are copied into
+`murmur_expert_comparison_<run>.csv`, with descriptive agreement counts in
+`murmur_expert_agreement_<run>.csv`. These describe an estimated murmur
 candidate, not clean-source ground truth. Amplitude is relative to each WAV's
 digital full scale and should not be interpreted as calibrated sound pressure
 or compared clinically across recording devices. The morphology labels are
@@ -101,6 +116,8 @@ python -m src.evaluation.synthetic_benchmark --quick
 
 The benchmark covers eight murmur timing/shapes and sweeps mixture ratios, SNRs, and seeds. It reports SI-SDR, SDR, SNR improvement, correlations, spectral/envelope error, onset/offset error, and cross-source leakage to `outputs/reports/synthetic_benchmark.csv`.
 Ground-truth mixtures and per-method estimated stems/metrics are retained under `outputs/synthetic/` for direct inspection.
+Use `--target-phase diastole` to place the known murmur source in diastole;
+combine it with `--tune-phase-thresholds` to write phase-specific tuning reports.
 
 ## Research order
 
@@ -110,3 +127,10 @@ The frozen 59-segment quality-gated evaluation currently fails separation
 acceptance (27/36 present candidates accepted and 6/15 absent negative controls
 clear). Treat the generated candidates as audit artifacts, not validated murmur
 sources; the detailed synthetic-to-real decision is recorded in the audit doc.
+
+Diastolic processing is additionally marked experimental. A synthetic-selected
+configuration achieved mean murmur SI-SDR 4.37 dB, but its frozen five-recording
+real audit accepted only 9/14 candidates; accepted timing agreed with CirCor in
+3/9 cases, shape agreed in 1/5 scorable cases, and only 3/14 candidates were
+stable to ±10 ms boundary perturbation. Do not expand this configuration to the
+full dataset or call its residuals clean diastolic murmurs.

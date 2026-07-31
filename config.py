@@ -21,7 +21,7 @@ DATASET_ROOT = Path(
         / "physionet.org"
         / "files"
         / "circor-heart-sound"
-        / "1.0.1",
+        / "1.0.3",
     )
 ).expanduser().resolve()
 AUDIO_DIR = DATASET_ROOT / "training_data"
