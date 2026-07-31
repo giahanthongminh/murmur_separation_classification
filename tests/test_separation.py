@@ -16,6 +16,7 @@ from src.separation.audit import (
     _absolute_timing_metrics,
     _all_recordings,
     _expert_agreement_metrics,
+    _interpretation_group,
     _should_save_package,
     _target_phase_metadata,
     _target_phases_for_recording,
@@ -601,6 +602,7 @@ def test_absolute_timing_is_exported_in_recording_seconds() -> None:
 def test_auto_target_phases_and_expert_agreement_are_phase_specific() -> None:
     recording = {
         "location_murmur_label": "Present",
+        "clinical_outcome": "Normal",
         "systole_timing_label": "Holosystolic",
         "systole_shape_label": "Plateau",
         "systole_pitch_label": "Medium",
@@ -623,6 +625,10 @@ def test_auto_target_phases_and_expert_agreement_are_phase_specific() -> None:
         "systole",
     )
     assert metadata["murmur_label"] == "Present"
+    assert metadata["clinical_outcome"] == "Normal"
+    assert metadata["interpretation_group"] == (
+        "present_normal_outcome_innocent_proxy"
+    )
     assert comparison["predicted_timing_label"] == "Holosystolic"
     assert comparison["predicted_shape_label"] == "Plateau"
     assert comparison["timing_label_agreement"] is True
@@ -635,12 +641,14 @@ def test_all_recordings_uses_exact_pairs_and_location_labels(tmp_path: Path) -> 
             {
                 "Patient ID": "111",
                 "Murmur": "Present",
+                "Outcome": "Abnormal",
                 "Murmur locations": "AV+PV",
                 "Systolic murmur timing": "Early-systolic",
             },
             {
                 "Patient ID": "222",
                 "Murmur": "Absent",
+                "Outcome": "Normal",
                 "Murmur locations": np.nan,
                 "Systolic murmur timing": np.nan,
             },
@@ -663,6 +671,25 @@ def test_all_recordings_uses_exact_pairs_and_location_labels(tmp_path: Path) -> 
     assert next(row for row in rows if row["recording_id"] == "111_MV_1")[
         "location"
     ] == "MV"
+    assert next(row for row in rows if row["recording_id"] == "111_AV")[
+        "clinical_outcome"
+    ] == "Abnormal"
+
+
+@pytest.mark.parametrize(
+    ("murmur_label", "outcome", "expected"),
+    [
+        ("Present", "Normal", "present_normal_outcome_innocent_proxy"),
+        ("Present", "Abnormal", "present_abnormal_outcome_pathological_proxy"),
+        ("Present", None, "present_unknown_outcome"),
+        ("Absent", "Normal", "not_scored"),
+        ("Unknown", "Abnormal", "not_scored"),
+    ],
+)
+def test_interpretation_group_is_cautious_about_clinical_outcome(
+    murmur_label: str, outcome: str | None, expected: str
+) -> None:
+    assert _interpretation_group(murmur_label, outcome) == expected
 
 
 @pytest.mark.parametrize(

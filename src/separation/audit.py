@@ -303,6 +303,7 @@ def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[
                     "murmur_label": murmur,
                     "location_murmur_label": murmur,
                     "patient_murmur_label": murmur,
+                    "clinical_outcome": _metadata_label(row.get("Outcome")),
                     "timing_label": timing,
                     "audit_group": group,
                     **_expert_phase_fields(row),
@@ -343,6 +344,21 @@ def _metadata_label(value: Any) -> str | None:
     return None if not label or label.lower() == "nan" else label
 
 
+def _interpretation_group(
+    location_murmur_label: str | None,
+    clinical_outcome: str | None,
+) -> str:
+    """Create cautious report groups from CirCor's two patient-level labels."""
+
+    if location_murmur_label != "Present":
+        return "not_scored"
+    if clinical_outcome == "Normal":
+        return "present_normal_outcome_innocent_proxy"
+    if clinical_outcome == "Abnormal":
+        return "present_abnormal_outcome_pathological_proxy"
+    return "present_unknown_outcome"
+
+
 def _expert_phase_fields(row: pd.Series) -> dict[str, str | None]:
     fields: dict[str, str | None] = {}
     for phase, prefix in (("systole", "Systolic"), ("diastole", "Diastolic")):
@@ -381,9 +397,14 @@ def _target_phase_metadata(
         phase_label = "Present"
     else:
         phase_label = "Unknown"
+    clinical_outcome = recording.get("clinical_outcome")
     return {
         "murmur_phase": target_phase,
         "murmur_label": phase_label,
+        "clinical_outcome": clinical_outcome,
+        "interpretation_group": _interpretation_group(
+            phase_label, clinical_outcome
+        ),
         "timing_label": expert_timing,
         "expert_timing_label": expert_timing,
         "expert_shape_label": recording.get(f"{target_phase}_shape_label"),
@@ -434,6 +455,7 @@ def _all_recordings(
                 "murmur_label": murmur_label,
                 "location_murmur_label": murmur_label,
                 "patient_murmur_label": patient_label,
+                "clinical_outcome": _metadata_label(row.get("Outcome")),
                 "timing_label": timing,
                 "audit_group": "All recordings",
                 **_expert_phase_fields(row),
@@ -1017,6 +1039,8 @@ def _write_diagnostic_plot(
         "\n".join(
             [
                 "Observation summary",
+                f"clinical outcome: {metadata.get('clinical_outcome')}",
+                f"interpretation group: {metadata.get('interpretation_group')}",
                 f"method / quality: {result.selected_method} / "
                 f"{format_metric('candidate_quality_status')}",
                 f"phase / timing quality: {metadata.get('murmur_phase')} / "
@@ -1056,6 +1080,8 @@ def _write_diagnostic_plot(
                 f"{format_metric('s2_leakage_ratio', 4)}",
                 "Expert labels are semantic references,",
                 "not clean-source waveform ground truth.",
+                "Normal/abnormal outcome groups are report proxies,",
+                "not definitive innocent/pathological diagnoses.",
             ]
         ),
         va="top",
@@ -1426,6 +1452,8 @@ def run_audit(
         "location",
         "cycle_index",
         "murmur_phase",
+        "clinical_outcome",
+        "interpretation_group",
         "timing_label",
         "expert_timing_label",
         "expert_shape_label",

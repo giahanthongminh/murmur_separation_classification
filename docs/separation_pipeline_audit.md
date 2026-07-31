@@ -211,6 +211,14 @@ measures each separated candidate, reports the central 95% PSD-energy range,
 and keeps the paper's 200 Hz and 80% duration values descriptive only; they are
 not imported as diagnostic or classification thresholds for CirCor.
 
+For the current two-case interpretation, `Present` murmur recordings are split
+by CirCor's patient-level clinical outcome. `Present + Normal` is an
+innocent-murmur proxy and `Present + Abnormal` is a pathological-murmur proxy.
+The wording deliberately remains "proxy": the outcome is not clean-source
+ground truth and does not prove that the separated candidate itself is innocent
+or pathological. The outcome and proxy group are printed on each diagnostic
+plot and exported with the observation rows.
+
 ## Systolic/diastolic observation extension
 
 `--target-phase auto` reads separate CirCor systolic and diastolic timing,

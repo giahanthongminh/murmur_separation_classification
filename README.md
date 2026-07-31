@@ -101,6 +101,11 @@ candidate, not clean-source ground truth. Amplitude is relative to each WAV's
 digital full scale and should not be interpreted as calibrated sound pressure
 or compared clinically across recording devices. The morphology labels are
 reproducible descriptive rules, not diagnoses or classifier ground truth.
+For interpretation, the exports also retain CirCor's patient-level `Outcome`.
+`Present + Normal` is labelled an innocent-murmur proxy and
+`Present + Abnormal` a pathological-murmur proxy. These are report groups, not
+definitive diagnoses of the separated waveform: `Outcome` can reflect clinical
+abnormality beyond the murmur itself.
 
 The per-cycle `diagnostic_plot.png` uses the same compact layout for systolic
 and diastolic candidates: phase-labelled phonocardiogram, normal-heart estimate,
