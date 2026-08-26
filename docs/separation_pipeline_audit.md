@@ -6,9 +6,15 @@ Audit baseline: commit `112e302` on the `gia-han` branch.
 
 The repository correctly moved from concatenated systolic intervals to per-segment processing, but the residual is not yet a verified murmur stem. The current implementation can route omitted SSA content, normal-heart detail, reconstruction error, and noise into a signal named `murmur`. Classification results therefore cannot establish separation quality.
 
-The local CirCor copy confirms the boundary risk: `training_data/` contains exactly 3,163 WAV recordings and 3,163 TSV annotations for 942 metadata rows, while recursive scanning of the full `1.0.1/` tree finds 4,379 WAV files.
+The local CirCor v1.0.3 copy contains exactly 3,163 WAV recordings and 3,163
+exactly paired TSV annotations for 942 metadata rows.
 
-Strict filename/content validation also found issues hidden by the equal totals: `50782_MV_1.wav` lacks an exact TSV pair, `50782_MV.tsv` is an orphan containing only the invalid row `0 0 28`, and five additional annotations contain overlaps or order discontinuities beyond a 1 ms rounding tolerance (`50150_MV`, `50690_MV_2`, `50690_TV`, `84851_PV`, and `84930_AV`). The full pipeline must exclude or repair these cases rather than reporting that all files are paired.
+Strict content validation still finds six unusable annotations. The newly paired
+`50782_MV_1.tsv` contains only the invalid row `0 0 28`; five additional files
+contain overlaps or order discontinuities beyond a 1 ms rounding tolerance
+(`50150_MV`, `50690_MV_2`, `50690_TV`, `84851_PV`, and `84930_AV`). The full
+pipeline must exclude these cases rather than interpreting equal file counts as
+proof that every annotation is usable.
 
 ## Path and data-loading audit
 
@@ -82,7 +88,13 @@ The refactor preserves the historical functions where practical while adding:
 
 Legacy classifier experiments are retained. Their paths are redirected to project outputs; they are not used to decide whether separation is valid.
 
-The repaired real-data audit processes each contiguous S1-systole-S2-diastole cycle without concatenating disjoint intervals. Timing is detected and normalized only within the systolic mask. `s1_leakage_ratio` and `s2_leakage_ratio` measure candidate energy in each heart-sound phase relative to original phase energy, while `outside_murmur_energy_ratio` measures the fraction of total candidate energy outside the annotated systole. This supplies full-cycle leakage context while retaining cycle identity.
+The repaired real-data audit processes each contiguous S1-systole-S2-diastole
+cycle without concatenating disjoint intervals. Timing is detected and
+normalized within the expert-requested target phase. `s1_leakage_ratio` and
+`s2_leakage_ratio` measure candidate energy in each heart-sound phase relative
+to original phase energy, while `outside_murmur_energy_ratio` measures the
+fraction of total candidate energy outside systole or diastole as appropriate.
+This supplies full-cycle leakage context while retaining cycle identity.
 
 Adjacent phase boundaries that differ by no more than the dataset validator's
 1 ms annotation tolerance are normalized to one shared sample boundary. Larger
@@ -90,7 +102,7 @@ gaps or overlaps remain invalid and are skipped rather than silently repaired.
 
 Phase-aware component selection now augments ZCR or kurtosis assignment with
 per-phase energy density. A provisional murmur component must meet configured
-systolic-focus and systole-to-S1/S2 thresholds. Rejected components are assigned
+target-phase focus and target-phase-to-S1/S2 thresholds. Rejected components are assigned
 whole to the normal-heart estimate rather than truncated at phase boundaries,
 preserving exact reconstruction and allowing the leakage metrics to remain an
 honest audit. A single best-component fallback keeps short-candidate timing
@@ -136,8 +148,8 @@ The audit can now enumerate every exact WAV/TSV pair instead of selecting one
 representative location per patient. Present-patient recordings are scored as
 `Present` only at locations listed in `Murmur locations`; other locations are
 kept as `Unknown` rather than incorrectly used as either positive or negative
-controls. On the inspected snapshot this yields 3,162 exact pairs because the
-known `50782_MV_1.wav` mismatch is excluded.
+controls. The v1.0.3 snapshot has 3,163 exact filename pairs; content-invalid
+annotations are excluded separately with recorded reasons.
 
 Long runs have an atomic per-recording checkpoint and a lightweight `summary`
 profile. Resume validates the configuration hash, requested method, recording
@@ -145,19 +157,25 @@ scope, and output profile before reusing rows. Invalid cardiac cycles are
 skipped with their reason saved separately rather than terminating the batch.
 
 For accepted candidates at location-aware Present recordings, observation
-features are calculated inside the detected systolic activity interval:
+features are calculated inside the detected systolic or diastolic activity
+interval selected from CirCor metadata:
 
-- onset and offset relative to systole, the cardiac-cycle context, and the
+- onset and offset relative to the target phase, cardiac-cycle context, and the
   original recording;
 - peak, RMS, mean absolute, envelope, and crest-factor amplitude;
+- candidate peak amplitude relative to the mean original S1/S2 peak, following
+  the phono-spectrographic paper's interpretable relative-volume convention;
 - smoothed-envelope shape, time to peak, rise/decay, symmetry, active-burst
   count, and active-duration ratios;
 - dominant frequency, centroid, bandwidth, and spectral entropy;
 - Welch PSD peak count, half-height width, prominence, secondary-peak ratio,
-  peak energy concentration, and energy fractions in six frequency bands;
+  peak energy concentration, central 95% energy frequency limits, energy above
+  200 Hz, and energy fractions in six frequency bands;
 - spectrogram peak time/frequency, time-frequency entropy, spectral flux, and
   the direction, slope, variability, and continuity of its dominant-frequency
   trajectory.
+- Morlet-wavelet peak time/frequency, frequency spread, entropy, and
+  concentration, plus feature stability under ±10 ms onset/offset shifts.
 
 PSD frequency resolution and spectrogram frame count/window resolution are
 exported beside those values. A one-frame spectrogram is retained for audit but
@@ -174,3 +192,49 @@ dominant-frequency trajectory so each exported description can be checked
 against the candidate waveform. `murmur_morphology_summary_<run>.csv` counts
 each envelope, PSD, and frequency-trajectory category within each murmur timing
 label, exposing dataset diversity without averaging categorical descriptions.
+
+The observation figure was simplified after visually reviewing the combined
+phono-spectrogram examples in *Phono-spectrographic analysis of heart murmur in
+children* (BMC Pediatrics 2007;7:23). The shared four-by-two systolic/diastolic
+layout retains the complete phase-labelled phonocardiogram, normal-heart
+estimate, murmur waveform/envelope, S1/S2-relative amplitude, PSD, spectrogram,
+wavelet scalogram, and concise expert/audit interpretation. The separate raw
+original panel, noise trace, SSA component bar chart, and long internal metric
+dump were removed from this observation figure because they duplicated context
+or served algorithm debugging rather than murmur interpretation. Their source
+arrays, component table, assignments, and metrics are still preserved.
+
+This is paper-aligned rather than an exact reproduction. The paper manually
+averaged three beats, used its own recording/filter/display calibration, and
+reported a manually read high-frequency limit. This pipeline automatically
+measures each separated candidate, reports the central 95% PSD-energy range,
+and keeps the paper's 200 Hz and 80% duration values descriptive only; they are
+not imported as diagnostic or classification thresholds for CirCor.
+
+For the current two-case interpretation, `Present` murmur recordings are split
+by CirCor's patient-level clinical outcome. `Present + Normal` is an
+innocent-murmur proxy and `Present + Abnormal` is a pathological-murmur proxy.
+The wording deliberately remains "proxy": the outcome is not clean-source
+ground truth and does not prove that the separated candidate itself is innocent
+or pathological. The outcome and proxy group are printed on each diagnostic
+plot and exported with the observation rows.
+
+## Systolic/diastolic observation extension
+
+`--target-phase auto` reads separate CirCor systolic and diastolic timing,
+shape, pitch, grade, and quality fields. Present recordings are processed only
+for their expert-labelled phase; Absent and Unknown controls may be inspected
+in both phases. Predictions are compared descriptively with those labels, which
+are semantic expert references rather than clean separated waveforms.
+
+Diastolic thresholds were selected only on 3,264 synthetic separations with
+known normal, murmur, and noise stems, then frozen before the five-recording
+real audit. The selected 20 ms window, target-phase focus 0.06, and
+target-phase-to-S1/S2 ratio 0.20 achieved mean synthetic murmur SI-SDR 4.37 dB.
+On 14 valid real cycles it accepted 9 candidates and fell back on 5. Among the
+accepted candidates, timing agreed with the CirCor label in 3/9 cases and shape
+agreed in 1/5 scorable cases. Mean outside-diastole energy was 0.68, mean
+diastolic retention was 0.092, and only 3/14 candidates were stable under ±10
+ms boundary shifts. This is a useful negative validation result: phase-complete
+reporting works, but the current CSSA residual is not a validated clean
+diastolic murmur source and must not yet be expanded to a full-dataset claim.

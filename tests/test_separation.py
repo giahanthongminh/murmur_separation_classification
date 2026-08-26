@@ -15,17 +15,24 @@ from src.separation.audit import (
     CardiacCycleContext,
     _absolute_timing_metrics,
     _all_recordings,
+    _expert_agreement_metrics,
+    _interpretation_group,
     _should_save_package,
+    _target_phase_metadata,
+    _target_phases_for_recording,
     build_cardiac_cycle_context,
     classify_audit_outcome,
     summarize_audit_quality,
+    summarize_expert_agreement,
     summarize_murmur_morphology_categories,
     summarize_murmur_observations,
 )
 from src.separation.metrics import (
+    boundary_robustness_metrics,
     detect_activity_interval,
     murmur_observation_features,
     real_proxy_metrics,
+    wavelet_scalogram,
 )
 from src.ssa import select_component_count, ssa_decompose_audited
 
@@ -112,6 +119,30 @@ def test_phase_selection_rejects_s1_s2_dominated_components() -> None:
     assert not used_fallback
 
 
+def test_phase_selection_can_target_diastolic_components() -> None:
+    rows = [
+        {
+            "diastole_focus_score": 0.65,
+            "diastole_to_s1_s2_ratio": 1.8,
+            "relative_energy": 0.1,
+        },
+        {
+            "diastole_focus_score": 0.05,
+            "diastole_to_s1_s2_ratio": 0.04,
+            "relative_energy": 0.3,
+        },
+    ]
+    selected, rejected, used_fallback = _phase_aware_murmur_indexes(
+        rows,
+        [0, 1],
+        SeparationConfig(phase_selection_fallback=False),
+        target_phase="diastole",
+    )
+    assert selected == [0]
+    assert rejected == [1]
+    assert not used_fallback
+
+
 def test_phase_energy_features_use_density_not_phase_duration() -> None:
     lengths = {"s1": 10, "systole": 20, "s2": 10, "diastole": 40}
     amplitudes = {"s1": 2.0, "systole": 4.0, "s2": 1.0, "diastole": 0.5}
@@ -132,6 +163,12 @@ def test_phase_energy_features_use_density_not_phase_duration() -> None:
     )
     assert features["systole_to_s1_s2_ratio"] == pytest.approx(
         4.0**2 / (2.0**2 + 1.0**2)
+    )
+    assert features["diastole_focus_score"] == pytest.approx(
+        0.5**2 / expected_density_total
+    )
+    assert features["diastole_to_s1_s2_ratio"] == pytest.approx(
+        0.5**2 / (2.0**2 + 1.0**2)
     )
 
 
@@ -269,6 +306,9 @@ def test_murmur_observation_features_capture_tone_and_amplitude() -> None:
     assert features["amplitude_rms"] == pytest.approx(0.4 / np.sqrt(2), rel=0.03)
     assert features["psd_peak_frequency_hz"] == pytest.approx(180, abs=10)
     assert features["psd_100_200_hz_ratio"] > 0.9
+    assert features["psd_above_200_hz_ratio"] < 0.1
+    assert features["psd_low_frequency_limit_95_hz"] < 180
+    assert features["psd_high_frequency_limit_95_hz"] > 180
     assert features["time_frequency_peak_hz"] == pytest.approx(180, abs=20)
     assert features["time_frequency_frame_count"] > 1
     assert features["time_frequency_frequency_resolution_hz"] > 0
@@ -378,8 +418,67 @@ def test_full_cycle_proxy_metrics_compute_phase_leakage() -> None:
         0.5**2 + 0.25**2 + 0.2**2 + 0.1**2
     )
     assert metrics["outside_murmur_energy_ratio"] == pytest.approx(expected_outside)
+    assert metrics["murmur_peak_relative_to_s1_s2_percent"] == pytest.approx(25.0)
+    assert 0 < metrics["murmur_duration_target_phase_percent"] <= 100
     assert metrics["onset_normalized"] is not None
     assert metrics["offset_normalized"] is not None
+
+
+def test_full_cycle_proxy_metrics_can_target_diastole() -> None:
+    samples_per_phase = 200
+    length = 4 * samples_per_phase
+    original = np.ones(length)
+    candidate = np.concatenate(
+        [
+            np.full(samples_per_phase, 0.05),
+            np.full(samples_per_phase, 0.10),
+            np.full(samples_per_phase, 0.05),
+            np.full(samples_per_phase, 0.50),
+        ]
+    )
+    masks = {}
+    for index, phase in enumerate(("s1", "systole", "s2", "diastole")):
+        mask = np.zeros(length, dtype=bool)
+        mask[index * samples_per_phase : (index + 1) * samples_per_phase] = True
+        masks[phase] = mask
+    metrics = real_proxy_metrics(
+        original,
+        original - candidate,
+        candidate,
+        np.zeros(length),
+        4000,
+        phase_masks=masks,
+        target_phase="diastole",
+    )
+    assert metrics["murmur_phase"] == "diastole"
+    assert metrics["murmur_region_energy_retention"] == pytest.approx(0.25)
+    assert metrics["diastole_candidate_energy_ratio"] == pytest.approx(0.25)
+    assert metrics["systole_candidate_energy_ratio"] == pytest.approx(0.01)
+    assert metrics["murmur_peak_relative_to_s1_s2_percent"] == pytest.approx(50.0)
+
+
+def test_boundary_robustness_is_stable_for_stationary_tone() -> None:
+    sample_rate = 4000
+    time = np.arange(int(0.4 * sample_rate)) / sample_rate
+    signal = 0.4 * np.sin(2 * np.pi * 180 * time)
+    robustness = boundary_robustness_metrics(
+        signal, sample_rate, int(0.05 * sample_rate), int(0.35 * sample_rate)
+    )
+    assert robustness["boundary_variant_count"] == 7
+    assert robustness["boundary_envelope_shape_agreement_ratio"] == pytest.approx(1.0)
+    assert robustness["boundary_stability_status"] == "robust"
+
+
+def test_wavelet_scalogram_tracks_tone_when_pywavelets_is_available() -> None:
+    pytest.importorskip("pywt")
+    sample_rate = 4000
+    time = np.arange(int(0.2 * sample_rate)) / sample_rate
+    signal = np.sin(2 * np.pi * 180 * time)
+    times, frequencies, power, status = wavelet_scalogram(signal, sample_rate)
+    assert status == "available"
+    peak = np.unravel_index(int(np.argmax(power)), power.shape)
+    assert frequencies[peak[0]] == pytest.approx(180, abs=35)
+    assert len(times) == len(signal)
 
 
 def test_cycle_context_contains_all_four_phases() -> None:
@@ -481,6 +580,60 @@ def test_absolute_timing_is_exported_in_recording_seconds() -> None:
     assert timing["murmur_offset_recording_seconds"] == pytest.approx(2.18)
     assert timing["timing_quality_status"] == "accepted_adaptive"
 
+    diastolic_timing = _absolute_timing_metrics(
+        {
+            "onset_sample": 20,
+            "offset_sample": 80,
+            "candidate_quality_status": "accepted",
+            "activity_detection_method": "adaptive_envelope",
+        },
+        cycle,
+        sample_rate,
+        target_phase="diastole",
+    )
+    assert diastolic_timing["murmur_onset_target_phase_seconds"] == pytest.approx(
+        0.02
+    )
+    assert diastolic_timing["murmur_onset_systole_seconds"] is None
+    assert diastolic_timing["murmur_onset_cycle_seconds"] == pytest.approx(0.32)
+    assert diastolic_timing["murmur_onset_recording_seconds"] == pytest.approx(2.32)
+
+
+def test_auto_target_phases_and_expert_agreement_are_phase_specific() -> None:
+    recording = {
+        "location_murmur_label": "Present",
+        "clinical_outcome": "Normal",
+        "systole_timing_label": "Holosystolic",
+        "systole_shape_label": "Plateau",
+        "systole_pitch_label": "Medium",
+        "diastole_timing_label": "Early-diastolic",
+        "diastole_shape_label": "Decrescendo",
+        "diastole_pitch_label": "High",
+    }
+    assert _target_phases_for_recording(recording, "auto") == [
+        "systole",
+        "diastole",
+    ]
+    metadata = _target_phase_metadata(recording, "systole")
+    comparison = _expert_agreement_metrics(
+        {
+            "onset_normalized": 0.05,
+            "offset_normalized": 0.90,
+            "envelope_shape": "constant",
+        },
+        metadata,
+        "systole",
+    )
+    assert metadata["murmur_label"] == "Present"
+    assert metadata["clinical_outcome"] == "Normal"
+    assert metadata["interpretation_group"] == (
+        "present_normal_outcome_innocent_proxy"
+    )
+    assert comparison["predicted_timing_label"] == "Holosystolic"
+    assert comparison["predicted_shape_label"] == "Plateau"
+    assert comparison["timing_label_agreement"] is True
+    assert comparison["shape_label_agreement"] is True
+
 
 def test_all_recordings_uses_exact_pairs_and_location_labels(tmp_path: Path) -> None:
     metadata = pd.DataFrame(
@@ -488,12 +641,14 @@ def test_all_recordings_uses_exact_pairs_and_location_labels(tmp_path: Path) -> 
             {
                 "Patient ID": "111",
                 "Murmur": "Present",
+                "Outcome": "Abnormal",
                 "Murmur locations": "AV+PV",
                 "Systolic murmur timing": "Early-systolic",
             },
             {
                 "Patient ID": "222",
                 "Murmur": "Absent",
+                "Outcome": "Normal",
                 "Murmur locations": np.nan,
                 "Systolic murmur timing": np.nan,
             },
@@ -516,6 +671,25 @@ def test_all_recordings_uses_exact_pairs_and_location_labels(tmp_path: Path) -> 
     assert next(row for row in rows if row["recording_id"] == "111_MV_1")[
         "location"
     ] == "MV"
+    assert next(row for row in rows if row["recording_id"] == "111_AV")[
+        "clinical_outcome"
+    ] == "Abnormal"
+
+
+@pytest.mark.parametrize(
+    ("murmur_label", "outcome", "expected"),
+    [
+        ("Present", "Normal", "present_normal_outcome_innocent_proxy"),
+        ("Present", "Abnormal", "present_abnormal_outcome_pathological_proxy"),
+        ("Present", None, "present_unknown_outcome"),
+        ("Absent", "Normal", "not_scored"),
+        ("Unknown", "Abnormal", "not_scored"),
+    ],
+)
+def test_interpretation_group_is_cautious_about_clinical_outcome(
+    murmur_label: str, outcome: str | None, expected: str
+) -> None:
+    assert _interpretation_group(murmur_label, outcome) == expected
 
 
 @pytest.mark.parametrize(
@@ -595,3 +769,31 @@ def test_morphology_summary_counts_only_accepted_present_candidates() -> None:
     assert set(morphology["category"]) == {"crescendo", "double_peak", "rising"}
     assert morphology["segment_count"].eq(1).all()
     assert morphology["ratio"].eq(1.0).all()
+
+
+def test_expert_agreement_summary_keeps_phase_and_pitch_context() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "murmur_label": "Present",
+                "candidate_quality_status": "accepted",
+                "murmur_phase": "diastole",
+                "expert_timing_label": "Early-diastolic",
+                "timing_label_agreement": True,
+                "expert_shape_label": "Decrescendo",
+                "shape_label_agreement": False,
+                "expert_pitch_label": "High",
+                "psd_primary_peak_frequency_hz": 420.0,
+            }
+        ]
+    )
+    agreement = summarize_expert_agreement(frame)
+    timing = agreement[agreement["comparison"].eq("timing")].iloc[0]
+    shape = agreement[agreement["comparison"].eq("shape")].iloc[0]
+    pitch = agreement[
+        agreement["comparison"].eq("expert_pitch_frequency")
+    ].iloc[0]
+    assert timing["agreement_ratio"] == pytest.approx(1.0)
+    assert shape["agreement_ratio"] == pytest.approx(0.0)
+    assert pitch["expert_category"] == "High"
+    assert pitch["mean_primary_frequency_hz"] == pytest.approx(420.0)

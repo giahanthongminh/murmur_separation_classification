@@ -43,6 +43,39 @@ def test_synthetic_absent_control_has_no_murmur_source() -> None:
     assert sample["offset_seconds"] is None
 
 
+def test_synthetic_cycle_can_place_murmur_only_in_diastole() -> None:
+    sample = make_synthetic_mixture(
+        "early_systolic",
+        sample_rate=1000,
+        duration=0.8,
+        murmur_to_heart_db=-3.0,
+        snr_db=20.0,
+        seed=42,
+        target_phase="diastole",
+    )
+    masks = sample["phase_masks"]
+    assert isinstance(masks, dict)
+    murmur = np.asarray(sample["true_murmur"])
+    diastole = np.asarray(masks["diastole"], dtype=bool)
+    assert sample["shape"] == "early_diastolic"
+    assert sample["target_phase"] == "diastole"
+    assert np.any(np.abs(murmur[diastole]) > 0)
+    assert np.allclose(murmur[~diastole], 0)
+
+
+def test_synthetic_holo_shape_name_tracks_target_phase() -> None:
+    sample = make_synthetic_mixture(
+        "holosystolic",
+        sample_rate=1000,
+        duration=0.8,
+        murmur_to_heart_db=-3.0,
+        snr_db=20.0,
+        seed=42,
+        target_phase="diastole",
+    )
+    assert sample["shape"] == "holodiastolic"
+
+
 def test_tuning_selection_uses_near_best_leakage_tie_breakers() -> None:
     summary = pd.DataFrame(
         [

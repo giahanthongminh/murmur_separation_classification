@@ -7,9 +7,13 @@ from scipy.signal import (
     find_peaks,
     hilbert,
     peak_widths,
-    savgol_filter,
     spectrogram,
     welch,
+)
+
+from src.separation.tier_a_features import (
+    extract_tier_a_features,
+    smoothed_hilbert_envelope,
 )
 
 
@@ -19,19 +23,8 @@ EPSILON = 1e-12
 def smooth_amplitude_envelope(signal: np.ndarray, sample_rate: int) -> np.ndarray:
     """Return a deterministic short-window envelope for morphology analysis."""
 
-    values = np.asarray(signal, dtype=float)
-    if values.size == 0:
-        return np.asarray([], dtype=float)
-    envelope = np.abs(hilbert(values)) if len(values) > 2 else np.abs(values)
-    if len(values) < 5:
-        return envelope
-    window = min(
-        len(values) if len(values) % 2 else len(values) - 1,
-        max(5, int(round(sample_rate * 0.012)) | 1),
-    )
-    if window < 5:
-        return envelope
-    return np.maximum(savgol_filter(envelope, window, 2, mode="interp"), 0.0)
+    envelope, _, _ = smoothed_hilbert_envelope(signal, sample_rate)
+    return envelope
 
 
 def dominant_frequency_trajectory(
@@ -56,6 +49,146 @@ def dominant_frequency_trajectory(
     band_frequencies = frequencies[band]
     ridge = band_frequencies[np.argmax(power[band], axis=0)]
     return times.astype(float), ridge.astype(float)
+
+
+def wavelet_scalogram(
+    signal: np.ndarray,
+    sample_rate: int,
+    *,
+    frequency_bins: int = 48,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Return a Morlet scalogram, with a graceful optional-dependency fallback."""
+
+    values = np.asarray(signal, dtype=float)
+    if values.size < 8 or energy(values) <= EPSILON:
+        empty = np.asarray([], dtype=float)
+        return empty, empty, np.empty((0, 0), dtype=float), "insufficient"
+    try:
+        import pywt
+    except ImportError:
+        empty = np.asarray([], dtype=float)
+        return empty, empty, np.empty((0, 0), dtype=float), "pywavelets_unavailable"
+    maximum_frequency = min(1000.0, sample_rate / 2.0)
+    if maximum_frequency <= 20.0:
+        empty = np.asarray([], dtype=float)
+        return empty, empty, np.empty((0, 0), dtype=float), "insufficient"
+    requested_frequencies = np.geomspace(20.0, maximum_frequency, frequency_bins)
+    central_frequency = float(pywt.central_frequency("morl"))
+    scales = central_frequency * sample_rate / requested_frequencies
+    coefficients, frequencies = pywt.cwt(
+        values,
+        scales,
+        "morl",
+        sampling_period=1.0 / sample_rate,
+    )
+    power = np.abs(coefficients) ** 2
+    order = np.argsort(frequencies)
+    times = np.arange(len(values), dtype=float) / sample_rate
+    return times, frequencies[order].astype(float), power[order], "available"
+
+
+def boundary_robustness_metrics(
+    phase_candidate: np.ndarray,
+    sample_rate: int,
+    onset_sample: int | None,
+    offset_sample: int | None,
+    *,
+    jitter_ms: float = 10.0,
+) -> dict[str, float | str]:
+    """Measure feature sensitivity to small onset/offset perturbations."""
+
+    values = np.asarray(phase_candidate, dtype=float)
+    if onset_sample is None or offset_sample is None or values.size < 8:
+        return {
+            "boundary_jitter_ms": float(jitter_ms),
+            "boundary_variant_count": 0.0,
+            "boundary_amplitude_rms_relative_range": 0.0,
+            "boundary_psd_peak_frequency_range_hz": 0.0,
+            "boundary_envelope_time_to_peak_ratio_range": 0.0,
+            "boundary_psd_width_relative_range": 0.0,
+            "boundary_envelope_shape_agreement_ratio": 0.0,
+            "boundary_stability_status": "insufficient",
+        }
+    onset = int(onset_sample)
+    offset = int(offset_sample)
+    jitter = max(1, int(round(jitter_ms * sample_rate / 1000.0)))
+    proposed = [
+        (onset, offset),
+        (onset - jitter, offset),
+        (onset + jitter, offset),
+        (onset, offset - jitter),
+        (onset, offset + jitter),
+        (onset - jitter, offset + jitter),
+        (onset + jitter, offset - jitter),
+    ]
+    bounds: list[tuple[int, int]] = []
+    for start, end in proposed:
+        start = max(0, start)
+        end = min(len(values), end)
+        if end - start >= 8 and (start, end) not in bounds:
+            bounds.append((start, end))
+    measurements: list[tuple[float, float, float, float, float]] = []
+    envelope_shapes: list[str] = []
+    for start, end in bounds:
+        segment = values[start:end]
+        rms = float(np.sqrt(np.mean(segment**2)))
+        envelope_features = _envelope_morphology(
+            smooth_amplitude_envelope(segment, sample_rate), sample_rate
+        )
+        frequencies, psd = welch(
+            segment,
+            fs=sample_rate,
+            nperseg=min(512, len(segment)),
+            detrend="constant",
+        )
+        psd_features = _psd_morphology(frequencies, psd)
+        envelope_shapes.append(str(envelope_features["envelope_shape"]))
+        measurements.append(
+            (
+                rms,
+                float(psd_features["psd_primary_peak_frequency_hz"]),
+                float(envelope_features["envelope_time_to_peak_ratio"]),
+                float(psd_features["psd_primary_peak_width_hz"]),
+                float(sample_rate / min(512, len(segment))),
+            )
+        )
+    if not measurements:
+        return boundary_robustness_metrics(
+            np.asarray([], dtype=float), sample_rate, None, None, jitter_ms=jitter_ms
+        )
+    table = np.asarray(measurements, dtype=float)
+    nominal = table[0]
+    rms_relative_range = float(np.ptp(table[:, 0]) / (nominal[0] + EPSILON))
+    frequency_range = float(np.ptp(table[:, 1]))
+    time_to_peak_range = (
+        0.0
+        if envelope_shapes and all(shape == "constant" for shape in envelope_shapes)
+        else float(np.ptp(table[:, 2]))
+    )
+    width_relative_range = float(np.ptp(table[:, 3]) / (nominal[3] + EPSILON))
+    shape_agreement = float(
+        np.mean(np.asarray(envelope_shapes) == envelope_shapes[0])
+    )
+    frequency_tolerance = max(50.0, 2.0 * nominal[4])
+    status = (
+        "robust"
+        if rms_relative_range <= 0.25
+        and frequency_range <= frequency_tolerance
+        and time_to_peak_range <= 0.25
+        and width_relative_range <= 0.50
+        and shape_agreement >= 0.70
+        else "sensitive"
+    )
+    return {
+        "boundary_jitter_ms": float(jitter_ms),
+        "boundary_variant_count": float(len(measurements)),
+        "boundary_amplitude_rms_relative_range": rms_relative_range,
+        "boundary_psd_peak_frequency_range_hz": frequency_range,
+        "boundary_envelope_time_to_peak_ratio_range": time_to_peak_range,
+        "boundary_psd_width_relative_range": width_relative_range,
+        "boundary_envelope_shape_agreement_ratio": shape_agreement,
+        "boundary_stability_status": status,
+    }
 
 
 def _contiguous_intervals(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -187,6 +320,8 @@ def _psd_morphology(
             "psd_peak_separation_hz": 0.0,
             "psd_primary_q_factor": 0.0,
             "psd_energy_concentration": 0.0,
+            "psd_low_frequency_limit_95_hz": 0.0,
+            "psd_high_frequency_limit_95_hz": 0.0,
         }
     normalized = band_psd / (float(np.max(band_psd)) + EPSILON)
     distance = max(1, int(round(40.0 / max(resolution, EPSILON))))
@@ -213,6 +348,19 @@ def _psd_morphology(
         right_index = primary + 1
     concentration = float(
         np.sum(band_psd[left_index:right_index]) / (np.sum(band_psd) + EPSILON)
+    )
+    cumulative_energy = np.cumsum(band_psd)
+    cumulative_energy /= cumulative_energy[-1] + EPSILON
+    low_frequency_limit = float(
+        band_frequencies[int(np.searchsorted(cumulative_energy, 0.025))]
+    )
+    high_frequency_limit = float(
+        band_frequencies[
+            min(
+                len(band_frequencies) - 1,
+                int(np.searchsorted(cumulative_energy, 0.975)),
+            )
+        ]
     )
     secondary_frequency = 0.0
     secondary_ratio = 0.0
@@ -246,6 +394,8 @@ def _psd_morphology(
         "psd_peak_separation_hz": float(separation),
         "psd_primary_q_factor": float(q_factor),
         "psd_energy_concentration": concentration,
+        "psd_low_frequency_limit_95_hz": low_frequency_limit,
+        "psd_high_frequency_limit_95_hz": high_frequency_limit,
     }
 
 
@@ -351,6 +501,7 @@ def murmur_observation_features(
             "psd_400_800_hz_ratio": 0.0,
             "psd_800_1000_hz_ratio": 0.0,
             "psd_above_1000_hz_ratio": 0.0,
+            "psd_above_200_hz_ratio": 0.0,
             "time_frequency_peak_hz": 0.0,
             "time_frequency_peak_seconds": 0.0,
             "time_frequency_frame_count": 0.0,
@@ -358,6 +509,13 @@ def murmur_observation_features(
             "time_frequency_window_seconds": 0.0,
             "time_frequency_entropy": 0.0,
             "time_frequency_spectral_flux": 0.0,
+            "wavelet_status": "insufficient",
+            "wavelet_peak_frequency_hz": 0.0,
+            "wavelet_peak_seconds": 0.0,
+            "wavelet_frequency_centroid_hz": 0.0,
+            "wavelet_frequency_spread_hz": 0.0,
+            "wavelet_entropy": 0.0,
+            "wavelet_peak_scale_energy_ratio": 0.0,
             **_envelope_morphology(np.asarray([], dtype=float), sample_rate),
             **_psd_morphology(np.asarray([], dtype=float), np.asarray([], dtype=float)),
             **_ridge_morphology(
@@ -410,6 +568,44 @@ def murmur_observation_features(
             )
     ridge_times, ridge = dominant_frequency_trajectory(values, sample_rate)
     frequency_resolution = float(sample_rate / nperseg)
+    wavelet_times, wavelet_frequencies, wavelet_power, wavelet_status = (
+        wavelet_scalogram(values, sample_rate)
+    )
+    wavelet_peak_frequency = 0.0
+    wavelet_peak_seconds = 0.0
+    wavelet_centroid = 0.0
+    wavelet_spread = 0.0
+    wavelet_entropy = 0.0
+    wavelet_concentration = 0.0
+    if wavelet_power.size:
+        wavelet_peak = np.unravel_index(
+            int(np.argmax(wavelet_power)), wavelet_power.shape
+        )
+        wavelet_peak_frequency = float(wavelet_frequencies[wavelet_peak[0]])
+        wavelet_peak_seconds = float(wavelet_times[wavelet_peak[1]])
+        frequency_energy = np.sum(wavelet_power, axis=1)
+        normalized_frequency_energy = frequency_energy / (
+            float(np.sum(frequency_energy)) + EPSILON
+        )
+        wavelet_centroid = float(
+            np.sum(wavelet_frequencies * normalized_frequency_energy)
+        )
+        wavelet_spread = float(
+            np.sqrt(
+                np.sum(
+                    (wavelet_frequencies - wavelet_centroid) ** 2
+                    * normalized_frequency_energy
+                )
+            )
+        )
+        normalized_wavelet = wavelet_power / (
+            float(np.sum(wavelet_power)) + EPSILON
+        )
+        entropy = -float(
+            np.sum(normalized_wavelet * np.log2(normalized_wavelet + EPSILON))
+        )
+        wavelet_entropy = entropy / np.log2(max(2, normalized_wavelet.size))
+        wavelet_concentration = float(np.max(normalized_frequency_energy))
 
     return {
         "amplitude_peak_abs": peak,
@@ -427,6 +623,7 @@ def murmur_observation_features(
         "psd_400_800_hz_ratio": band_ratio(400, 800),
         "psd_800_1000_hz_ratio": band_ratio(800, 1000),
         "psd_above_1000_hz_ratio": band_ratio(1000, None),
+        "psd_above_200_hz_ratio": band_ratio(200, None),
         "time_frequency_peak_hz": peak_frequency,
         "time_frequency_peak_seconds": peak_seconds,
         "time_frequency_frame_count": float(tf_power.shape[1]),
@@ -434,6 +631,13 @@ def murmur_observation_features(
         "time_frequency_window_seconds": float(nperseg / sample_rate),
         "time_frequency_entropy": float(tf_entropy),
         "time_frequency_spectral_flux": spectral_flux,
+        "wavelet_status": wavelet_status,
+        "wavelet_peak_frequency_hz": wavelet_peak_frequency,
+        "wavelet_peak_seconds": wavelet_peak_seconds,
+        "wavelet_frequency_centroid_hz": wavelet_centroid,
+        "wavelet_frequency_spread_hz": wavelet_spread,
+        "wavelet_entropy": wavelet_entropy,
+        "wavelet_peak_scale_energy_ratio": wavelet_concentration,
         **_envelope_morphology(smooth_envelope, sample_rate),
         **_psd_morphology(psd_frequencies, psd),
         **_ridge_morphology(ridge_times, ridge, frequency_resolution),
@@ -567,13 +771,20 @@ def real_proxy_metrics(
     minimum_duration_ms: float = 30.0,
     merge_gap_ms: float = 20.0,
     phase_masks: dict[str, np.ndarray] | None = None,
+    target_phase: str = "systole",
 ) -> dict[str, float | str | None]:
+    if target_phase not in {"systole", "diastole"}:
+        raise ValueError("target_phase must be 'systole' or 'diastole'")
     original_energy = energy(original)
     reconstructed = normal + murmur_candidate + noise_candidate
     reconstruction_error = float(
         np.linalg.norm(np.asarray(original) - reconstructed)
         / (np.linalg.norm(original) + EPSILON)
     )
+    s1_reference_peak_abs: float | None = None
+    s2_reference_peak_abs: float | None = None
+    s1_reference_values: np.ndarray | None = None
+    s2_reference_values: np.ndarray | None = None
     if phase_masks is None:
         timing_candidate = np.asarray(murmur_candidate)
         murmur_region_energy_retention = energy(murmur_candidate) / (
@@ -582,24 +793,38 @@ def real_proxy_metrics(
         s1_leakage_ratio = None
         s2_leakage_ratio = None
         outside_murmur_energy_ratio = None
+        systole_candidate_energy_ratio = None
+        diastole_candidate_energy_ratio = None
     else:
         length = len(np.asarray(original))
         s1_mask = _validated_phase_mask(phase_masks, "s1", length)
         systole_mask = _validated_phase_mask(phase_masks, "systole", length)
         s2_mask = _validated_phase_mask(phase_masks, "s2", length)
+        diastole_mask = _validated_phase_mask(phase_masks, "diastole", length)
+        target_mask = systole_mask if target_phase == "systole" else diastole_mask
         candidate_values = np.asarray(murmur_candidate)
         original_values = np.asarray(original)
-        timing_candidate = candidate_values[systole_mask]
+        s1_reference_values = original_values[s1_mask]
+        s2_reference_values = original_values[s2_mask]
+        s1_reference_peak_abs = float(np.max(np.abs(original_values[s1_mask])))
+        s2_reference_peak_abs = float(np.max(np.abs(original_values[s2_mask])))
+        timing_candidate = candidate_values[target_mask]
         s1_leakage_ratio = energy(candidate_values[s1_mask]) / (
             energy(original_values[s1_mask]) + EPSILON
         )
         s2_leakage_ratio = energy(candidate_values[s2_mask]) / (
             energy(original_values[s2_mask]) + EPSILON
         )
-        murmur_region_energy_retention = energy(candidate_values[systole_mask]) / (
+        systole_candidate_energy_ratio = energy(candidate_values[systole_mask]) / (
             energy(original_values[systole_mask]) + EPSILON
         )
-        outside_murmur_energy_ratio = energy(candidate_values[~systole_mask]) / (
+        diastole_candidate_energy_ratio = energy(candidate_values[diastole_mask]) / (
+            energy(original_values[diastole_mask]) + EPSILON
+        )
+        murmur_region_energy_retention = energy(candidate_values[target_mask]) / (
+            energy(original_values[target_mask]) + EPSILON
+        )
+        outside_murmur_energy_ratio = energy(candidate_values[~target_mask]) / (
             energy(candidate_values) + EPSILON
         )
     timing = detect_activity_interval(
@@ -616,7 +841,38 @@ def real_proxy_metrics(
         observation_candidate = timing_candidate[int(onset) : int(offset)]
     else:
         observation_candidate = timing_candidate
+    murmur_observation_peak_abs = (
+        float(np.max(np.abs(observation_candidate)))
+        if observation_candidate.size
+        else 0.0
+    )
+    if s1_reference_peak_abs is None or s2_reference_peak_abs is None:
+        s1_s2_reference_peak_abs = None
+        murmur_peak_relative_to_s1_s2_ratio = None
+    else:
+        s1_s2_reference_peak_abs = 0.5 * (
+            s1_reference_peak_abs + s2_reference_peak_abs
+        )
+        murmur_peak_relative_to_s1_s2_ratio = murmur_observation_peak_abs / (
+            s1_s2_reference_peak_abs + EPSILON
+        )
     observation = murmur_observation_features(observation_candidate, sample_rate)
+    tier_a = extract_tier_a_features(
+        observation_candidate,
+        sample_rate,
+        phase_start_sample=0,
+        phase_end_sample=len(timing_candidate),
+        onset_sample=None if onset is None else int(onset),
+        offset_sample=None if offset is None else int(offset),
+        s1_reference=s1_reference_values,
+        s2_reference=s2_reference_values,
+    )
+    robustness = boundary_robustness_metrics(
+        timing_candidate,
+        sample_rate,
+        None if onset is None else int(onset),
+        None if offset is None else int(offset),
+    )
     return {
         "reconstruction_error": reconstruction_error,
         "normal_residual_correlation": safe_correlation(normal, murmur_candidate),
@@ -624,12 +880,33 @@ def real_proxy_metrics(
         "s2_leakage_ratio": s2_leakage_ratio,
         "murmur_region_energy_retention": murmur_region_energy_retention,
         "outside_murmur_energy_ratio": outside_murmur_energy_ratio,
+        "systole_candidate_energy_ratio": systole_candidate_energy_ratio,
+        "diastole_candidate_energy_ratio": diastole_candidate_energy_ratio,
+        "murmur_phase": target_phase,
+        "murmur_duration_target_phase_percent": (
+            None
+            if timing["duration_ratio"] is None
+            else 100.0 * float(timing["duration_ratio"])
+        ),
+        "s1_reference_peak_abs": s1_reference_peak_abs,
+        "s2_reference_peak_abs": s2_reference_peak_abs,
+        "s1_s2_reference_peak_abs": s1_s2_reference_peak_abs,
+        "murmur_peak_relative_to_s1_s2_ratio": (
+            murmur_peak_relative_to_s1_s2_ratio
+        ),
+        "murmur_peak_relative_to_s1_s2_percent": (
+            None
+            if murmur_peak_relative_to_s1_s2_ratio is None
+            else 100.0 * murmur_peak_relative_to_s1_s2_ratio
+        ),
         "noise_energy_ratio": energy(noise_candidate) / (original_energy + EPSILON),
         "residual_spectral_centroid": spectral["spectral_centroid"],
         "residual_bandwidth": spectral["spectral_bandwidth"],
         "residual_spectral_entropy": spectral["spectral_entropy"],
         "residual_dominant_frequency": spectral["dominant_frequency"],
         **observation,
+        **tier_a,
+        **robustness,
         **timing,
     }
 

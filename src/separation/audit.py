@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.io import wavfile
-from scipy.signal import hilbert, resample_poly, spectrogram
+from scipy.signal import hilbert, resample_poly, spectrogram, welch
 
 from config import (
     ANNOTATION_BOUNDARY_TOLERANCE_SECONDS,
@@ -37,7 +37,9 @@ from src.separation.metrics import (
     dominant_frequency_trajectory,
     real_proxy_metrics,
     smooth_amplitude_envelope,
+    wavelet_scalogram,
 )
+from src.separation.tier_a_features import TIER_A_EXPORT_COLUMNS
 
 
 OBSERVATION_METRICS = [
@@ -46,9 +48,12 @@ OBSERVATION_METRICS = [
     "duration_ratio",
     "temporal_energy_centroid",
     "peak_position",
+    "murmur_onset_target_phase_seconds",
+    "murmur_offset_target_phase_seconds",
     "murmur_onset_systole_seconds",
     "murmur_offset_systole_seconds",
     "murmur_duration_seconds",
+    "murmur_duration_target_phase_percent",
     "murmur_onset_cycle_seconds",
     "murmur_offset_cycle_seconds",
     "murmur_onset_recording_seconds",
@@ -59,6 +64,11 @@ OBSERVATION_METRICS = [
     "amplitude_envelope_peak",
     "amplitude_envelope_mean",
     "amplitude_crest_factor",
+    "s1_reference_peak_abs",
+    "s2_reference_peak_abs",
+    "s1_s2_reference_peak_abs",
+    "murmur_peak_relative_to_s1_s2_ratio",
+    "murmur_peak_relative_to_s1_s2_percent",
     "envelope_shape",
     "envelope_time_to_peak_ratio",
     "envelope_rise_time_seconds",
@@ -85,6 +95,7 @@ OBSERVATION_METRICS = [
     "psd_400_800_hz_ratio",
     "psd_800_1000_hz_ratio",
     "psd_above_1000_hz_ratio",
+    "psd_above_200_hz_ratio",
     "psd_morphology",
     "psd_primary_peak_frequency_hz",
     "psd_prominent_peak_count",
@@ -95,6 +106,8 @@ OBSERVATION_METRICS = [
     "psd_peak_separation_hz",
     "psd_primary_q_factor",
     "psd_energy_concentration",
+    "psd_low_frequency_limit_95_hz",
+    "psd_high_frequency_limit_95_hz",
     "time_frequency_peak_hz",
     "time_frequency_peak_seconds",
     "time_frequency_peak_cycle_seconds",
@@ -110,6 +123,22 @@ OBSERVATION_METRICS = [
     "time_frequency_ridge_slope_hz_per_second",
     "time_frequency_ridge_variability_hz",
     "time_frequency_ridge_continuity",
+    "wavelet_status",
+    "wavelet_peak_frequency_hz",
+    "wavelet_peak_seconds",
+    "wavelet_frequency_centroid_hz",
+    "wavelet_frequency_spread_hz",
+    "wavelet_entropy",
+    "wavelet_peak_scale_energy_ratio",
+    "boundary_jitter_ms",
+    "boundary_variant_count",
+    "boundary_amplitude_rms_relative_range",
+    "boundary_psd_peak_frequency_range_hz",
+    "boundary_envelope_time_to_peak_ratio_range",
+    "boundary_psd_width_relative_range",
+    "boundary_envelope_shape_agreement_ratio",
+    "boundary_stability_status",
+    *TIER_A_EXPORT_COLUMNS,
 ]
 
 
@@ -242,7 +271,7 @@ def build_cardiac_cycle_context(
     )
 
 
-def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[str, str]]:
+def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[str, Any]]:
     groups: dict[str, list[dict[str, str]]] = {
         "Absent": [],
         "Early-systolic": [],
@@ -261,7 +290,9 @@ def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[
             group = "Holosystolic"
         else:
             group = "Other timing"
-        locations = str(row.get("Locations", "")).split("+")
+        locations = _recording_locations(row)
+        if not locations:
+            continue
         preferred = str(row.get("Most audible location", ""))
         location = preferred if preferred in locations else locations[0]
         recording_id = f"{patient_id}_{location}"
@@ -272,8 +303,12 @@ def _representative_recordings(metadata: pd.DataFrame, limit: int) -> list[dict[
                     "recording_id": recording_id,
                     "location": location,
                     "murmur_label": murmur,
+                    "location_murmur_label": murmur,
+                    "patient_murmur_label": murmur,
+                    "clinical_outcome": _metadata_label(row.get("Outcome")),
                     "timing_label": timing,
                     "audit_group": group,
+                    **_expert_phase_fields(row),
                 }
             )
     selected: list[dict[str, str]] = []
@@ -292,12 +327,101 @@ def _metadata_locations(value: Any) -> set[str]:
     return {item.strip() for item in str(value).split("+") if item.strip()}
 
 
+def _recording_locations(row: pd.Series) -> list[str]:
+    """Read recording locations from either released CirCor CSV schema."""
+
+    for column in ("Recording locations:", "Locations"):
+        locations = sorted(_metadata_locations(row.get(column)))
+        if locations:
+            return locations
+    return []
+
+
+def _metadata_label(value: Any) -> str | None:
+    """Return a usable CirCor annotation label instead of textual NaN."""
+
+    if pd.isna(value):
+        return None
+    label = str(value).strip()
+    return None if not label or label.lower() == "nan" else label
+
+
+def _interpretation_group(
+    location_murmur_label: str | None,
+    clinical_outcome: str | None,
+) -> str:
+    """Create cautious report groups from CirCor's two patient-level labels."""
+
+    if location_murmur_label != "Present":
+        return "not_scored"
+    if clinical_outcome == "Normal":
+        return "present_normal_outcome_innocent_proxy"
+    if clinical_outcome == "Abnormal":
+        return "present_abnormal_outcome_pathological_proxy"
+    return "present_unknown_outcome"
+
+
+def _expert_phase_fields(row: pd.Series) -> dict[str, str | None]:
+    fields: dict[str, str | None] = {}
+    for phase, prefix in (("systole", "Systolic"), ("diastole", "Diastolic")):
+        for name in ("timing", "shape", "pitch", "grading", "quality"):
+            fields[f"{phase}_{name}_label"] = _metadata_label(
+                row.get(f"{prefix} murmur {name}")
+            )
+    return fields
+
+
+def _target_phases_for_recording(
+    recording: dict[str, Any], requested_phase: str
+) -> list[str]:
+    if requested_phase in {"systole", "diastole"}:
+        return [requested_phase]
+    if requested_phase != "auto":
+        raise ValueError("target_phase must be auto, systole, or diastole")
+    if recording.get("location_murmur_label") == "Present":
+        phases = [
+            phase
+            for phase in ("systole", "diastole")
+            if recording.get(f"{phase}_timing_label") is not None
+        ]
+        return phases or ["systole"]
+    return ["systole", "diastole"]
+
+
+def _target_phase_metadata(
+    recording: dict[str, Any], target_phase: str
+) -> dict[str, Any]:
+    location_label = str(recording.get("location_murmur_label", "Unknown"))
+    expert_timing = recording.get(f"{target_phase}_timing_label")
+    if location_label == "Absent":
+        phase_label = "Absent"
+    elif location_label == "Present" and expert_timing is not None:
+        phase_label = "Present"
+    else:
+        phase_label = "Unknown"
+    clinical_outcome = recording.get("clinical_outcome")
+    return {
+        "murmur_phase": target_phase,
+        "murmur_label": phase_label,
+        "clinical_outcome": clinical_outcome,
+        "interpretation_group": _interpretation_group(
+            phase_label, clinical_outcome
+        ),
+        "timing_label": expert_timing,
+        "expert_timing_label": expert_timing,
+        "expert_shape_label": recording.get(f"{target_phase}_shape_label"),
+        "expert_pitch_label": recording.get(f"{target_phase}_pitch_label"),
+        "expert_grading_label": recording.get(f"{target_phase}_grading_label"),
+        "expert_quality_label": recording.get(f"{target_phase}_quality_label"),
+    }
+
+
 def _all_recordings(
     metadata: pd.DataFrame,
     limit: int,
     *,
     audio_dir: Path = AUDIO_DIR,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Enumerate every exact WAV/TSV pair with conservative location-aware labels."""
 
     patient_rows = {
@@ -331,9 +455,12 @@ def _all_recordings(
                 "recording_id": recording_id,
                 "location": location,
                 "murmur_label": murmur_label,
+                "location_murmur_label": murmur_label,
                 "patient_murmur_label": patient_label,
+                "clinical_outcome": _metadata_label(row.get("Outcome")),
                 "timing_label": timing,
                 "audit_group": "All recordings",
+                **_expert_phase_fields(row),
             }
         )
         if limit > 0 and len(selected) >= limit:
@@ -345,8 +472,12 @@ def _absolute_timing_metrics(
     metrics: dict[str, Any],
     cycle: CardiacCycleContext,
     sample_rate: int,
+    target_phase: str = "systole",
 ) -> dict[str, Any]:
-    """Convert systole-relative detector output into cycle and recording seconds."""
+    """Convert target-phase detector output into cycle and recording seconds."""
+
+    if target_phase not in {"systole", "diastole"}:
+        raise ValueError("target_phase must be 'systole' or 'diastole'")
 
     onset = metrics.get("onset_sample")
     offset = metrics.get("offset_sample")
@@ -354,6 +485,8 @@ def _absolute_timing_metrics(
     detection = str(metrics.get("activity_detection_method", "silent_or_invalid"))
     if onset is None or offset is None:
         return {
+            "murmur_onset_target_phase_seconds": None,
+            "murmur_offset_target_phase_seconds": None,
             "murmur_onset_systole_seconds": None,
             "murmur_offset_systole_seconds": None,
             "murmur_duration_seconds": None,
@@ -365,7 +498,7 @@ def _absolute_timing_metrics(
             "time_frequency_peak_recording_seconds": None,
             "timing_quality_status": "unavailable",
         }
-    systole_start = cycle.phase_bounds["systole"][0]
+    target_start = cycle.phase_bounds[target_phase][0]
     onset = int(onset)
     offset = int(offset)
     time_frequency_peak = float(metrics.get("time_frequency_peak_seconds", 0.0))
@@ -376,28 +509,157 @@ def _absolute_timing_metrics(
     else:
         timing_status = "accepted_energy_fallback"
     return {
-        "murmur_onset_systole_seconds": onset / sample_rate,
-        "murmur_offset_systole_seconds": offset / sample_rate,
+        "murmur_onset_target_phase_seconds": onset / sample_rate,
+        "murmur_offset_target_phase_seconds": offset / sample_rate,
+        "murmur_onset_systole_seconds": (
+            onset / sample_rate if target_phase == "systole" else None
+        ),
+        "murmur_offset_systole_seconds": (
+            offset / sample_rate if target_phase == "systole" else None
+        ),
         "murmur_duration_seconds": (offset - onset) / sample_rate,
-        "murmur_onset_cycle_seconds": (systole_start + onset) / sample_rate,
-        "murmur_offset_cycle_seconds": (systole_start + offset) / sample_rate,
+        "murmur_onset_cycle_seconds": (target_start + onset) / sample_rate,
+        "murmur_offset_cycle_seconds": (target_start + offset) / sample_rate,
         "murmur_onset_recording_seconds": (
-            cycle.context_start_sample + systole_start + onset
+            cycle.context_start_sample + target_start + onset
         )
         / sample_rate,
         "murmur_offset_recording_seconds": (
-            cycle.context_start_sample + systole_start + offset
+            cycle.context_start_sample + target_start + offset
         )
         / sample_rate,
         "time_frequency_peak_cycle_seconds": (
-            (systole_start + onset) / sample_rate + time_frequency_peak
+            (target_start + onset) / sample_rate + time_frequency_peak
         ),
         "time_frequency_peak_recording_seconds": (
-            (cycle.context_start_sample + systole_start + onset) / sample_rate
+            (cycle.context_start_sample + target_start + onset) / sample_rate
             + time_frequency_peak
         ),
         "timing_quality_status": timing_status,
     }
+
+
+def _predicted_timing_label(metrics: dict[str, Any], target_phase: str) -> str | None:
+    onset = metrics.get("onset_normalized")
+    offset = metrics.get("offset_normalized")
+    if onset is None or offset is None:
+        return None
+    onset = float(onset)
+    offset = float(offset)
+    duration = offset - onset
+    phase_name = "systolic" if target_phase == "systole" else "diastolic"
+    if duration >= 0.75 and onset <= 0.15 and offset >= 0.85:
+        return "Holosystolic" if target_phase == "systole" else "Holodiastolic"
+    midpoint = 0.5 * (onset + offset)
+    position = "Early" if midpoint < 1 / 3 else "Mid" if midpoint < 2 / 3 else "Late"
+    return f"{position}-{phase_name}"
+
+
+def _expert_agreement_metrics(
+    metrics: dict[str, Any], metadata: dict[str, Any], target_phase: str
+) -> dict[str, Any]:
+    predicted_timing = _predicted_timing_label(metrics, target_phase)
+    expert_timing = metadata.get("expert_timing_label")
+    envelope_shape = str(metrics.get("envelope_shape", "insufficient"))
+    shape_mapping = {
+        "constant": "Plateau",
+        "crescendo": "Crescendo",
+        "decrescendo": "Decrescendo",
+        "crescendo_decrescendo": "Diamond",
+    }
+    predicted_shape = shape_mapping.get(envelope_shape)
+    expert_shape = metadata.get("expert_shape_label")
+    return {
+        "predicted_timing_label": predicted_timing,
+        "predicted_shape_label": predicted_shape,
+        "timing_label_agreement": (
+            None
+            if predicted_timing is None or expert_timing is None
+            else predicted_timing == expert_timing
+        ),
+        "shape_label_agreement": (
+            None
+            if predicted_shape is None or expert_shape is None
+            else predicted_shape == expert_shape
+        ),
+    }
+
+
+def summarize_expert_agreement(summary: pd.DataFrame) -> pd.DataFrame:
+    """Summarize timing/shape agreement and frequency by expert pitch label."""
+
+    columns = [
+        "murmur_phase",
+        "comparison",
+        "expert_category",
+        "segment_count",
+        "scorable_count",
+        "agreement_count",
+        "agreement_ratio",
+        "mean_primary_frequency_hz",
+        "median_primary_frequency_hz",
+    ]
+    required = {"murmur_label", "candidate_quality_status", "murmur_phase"}
+    if summary.empty or not required.issubset(summary.columns):
+        return pd.DataFrame(columns=columns)
+    selected = summary[
+        summary["murmur_label"].eq("Present")
+        & summary["candidate_quality_status"].eq("accepted")
+    ]
+    rows: list[dict[str, Any]] = []
+    for phase, group in selected.groupby("murmur_phase", dropna=False):
+        for comparison, expert_column, agreement_column in (
+            ("timing", "expert_timing_label", "timing_label_agreement"),
+            ("shape", "expert_shape_label", "shape_label_agreement"),
+        ):
+            if expert_column not in group or agreement_column not in group:
+                continue
+            scorable = group[group[agreement_column].notna()]
+            rows.append(
+                {
+                    "murmur_phase": phase,
+                    "comparison": comparison,
+                    "expert_category": "all",
+                    "segment_count": int(len(group)),
+                    "scorable_count": int(len(scorable)),
+                    "agreement_count": int(scorable[agreement_column].astype(bool).sum()),
+                    "agreement_ratio": (
+                        float(scorable[agreement_column].astype(bool).mean())
+                        if len(scorable)
+                        else None
+                    ),
+                    "mean_primary_frequency_hz": None,
+                    "median_primary_frequency_hz": None,
+                }
+            )
+        if {
+            "expert_pitch_label",
+            "psd_primary_peak_frequency_hz",
+        }.issubset(group.columns):
+            for pitch, pitch_group in group.dropna(
+                subset=["expert_pitch_label"]
+            ).groupby("expert_pitch_label"):
+                frequencies = pd.to_numeric(
+                    pitch_group["psd_primary_peak_frequency_hz"], errors="coerce"
+                ).dropna()
+                rows.append(
+                    {
+                        "murmur_phase": phase,
+                        "comparison": "expert_pitch_frequency",
+                        "expert_category": pitch,
+                        "segment_count": int(len(pitch_group)),
+                        "scorable_count": int(len(frequencies)),
+                        "agreement_count": None,
+                        "agreement_ratio": None,
+                        "mean_primary_frequency_hz": (
+                            float(frequencies.mean()) if len(frequencies) else None
+                        ),
+                        "median_primary_frequency_hz": (
+                            float(frequencies.median()) if len(frequencies) else None
+                        ),
+                    }
+                )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def _should_save_package(output_profile: str, quality_status: str) -> bool:
@@ -414,6 +676,7 @@ def summarize_murmur_observations(summary: pd.DataFrame) -> pd.DataFrame:
     """Describe accepted Present candidates without promoting them to ground truth."""
 
     base_columns = [
+        "murmur_phase",
         "timing_label",
         "activity_detection_method",
         "segment_count",
@@ -434,7 +697,11 @@ def summarize_murmur_observations(summary: pd.DataFrame) -> pd.DataFrame:
     ]
     if selected.empty or not available_metrics:
         return pd.DataFrame(columns=base_columns)
-    group_columns = ["timing_label", "activity_detection_method"]
+    group_columns = [
+        column
+        for column in ("murmur_phase", "timing_label", "activity_detection_method")
+        if column in selected
+    ]
     grouped = selected.groupby(group_columns, dropna=False, sort=True)
     result = grouped.size().rename("segment_count").to_frame()
     aggregates = grouped[available_metrics].agg(["mean", "median"])
@@ -448,7 +715,14 @@ def summarize_murmur_observations(summary: pd.DataFrame) -> pd.DataFrame:
 def summarize_murmur_morphology_categories(summary: pd.DataFrame) -> pd.DataFrame:
     """Count rule-based morphology labels among accepted Present candidates."""
 
-    columns = ["timing_label", "dimension", "category", "segment_count", "ratio"]
+    columns = [
+        "murmur_phase",
+        "timing_label",
+        "dimension",
+        "category",
+        "segment_count",
+        "ratio",
+    ]
     required = {"murmur_label", "candidate_quality_status", "timing_label"}
     if summary.empty or not required.issubset(summary.columns):
         return pd.DataFrame(columns=columns)
@@ -466,14 +740,21 @@ def summarize_murmur_morphology_categories(summary: pd.DataFrame) -> pd.DataFram
         if name in selected
     ]
     rows: list[dict[str, Any]] = []
-    for timing_label, group in selected.groupby("timing_label", dropna=False):
+    group_columns = [
+        column for column in ("murmur_phase", "timing_label") if column in selected
+    ]
+    for group_key, group in selected.groupby(group_columns, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        group_values = dict(zip(group_columns, group_key))
         for dimension in dimensions:
             counts = group[dimension].fillna("missing").astype(str).value_counts()
             total = int(counts.sum())
             for category, count in counts.items():
                 rows.append(
                     {
-                        "timing_label": timing_label,
+                        "murmur_phase": group_values.get("murmur_phase"),
+                        "timing_label": group_values.get("timing_label"),
                         "dimension": dimension,
                         "category": category,
                         "segment_count": int(count),
@@ -499,6 +780,8 @@ def _write_diagnostic_plot(
     sample_rate: int,
     metadata: dict[str, Any],
 ) -> None:
+    """Write one compact, paper-aligned observation figure for either phase."""
+
     time = np.arange(len(result.original)) / sample_rate
     onset_seconds = result.metrics.get("murmur_onset_cycle_seconds")
     offset_seconds = result.metrics.get("murmur_offset_cycle_seconds")
@@ -517,50 +800,66 @@ def _write_diagnostic_plot(
     observation_candidate = result.murmur_candidate[
         observation_start:observation_end
     ]
-    figure, axes = plt.subplots(5, 2, figsize=(15, 18))
+    phase = str(metadata.get("murmur_phase", "target phase"))
+    figure, axes = plt.subplots(4, 2, figsize=(15, 16))
     axes = axes.ravel()
-    axes[0].plot(time, result.original, linewidth=0.7)
-    axes[0].set_title("Original complete cardiac-cycle context")
-    axes[1].plot(time, result.original, linewidth=0.7)
+    figure.suptitle(
+        f"{metadata['recording_id']} - {phase.title()} murmur observation",
+        fontsize=15,
+    )
+
     phase_colors = {
         "s1": "tab:green",
         "systole": "tab:blue",
         "s2": "tab:orange",
         "diastole": "tab:purple",
     }
+    axes[0].plot(time, result.original, linewidth=0.7, color="tab:blue")
     for phase, color in phase_colors.items():
         start = metadata[f"{phase}_relative_start_sample"] / sample_rate
         end = metadata[f"{phase}_relative_end_sample"] / sample_rate
-        axes[1].axvspan(start, end, alpha=0.18, color=color, label=phase)
-    axes[1].legend(loc="upper right")
-    axes[1].set_title("TSV cardiac phases")
-    axes[2].plot(time, result.normal_estimate, linewidth=0.7)
-    axes[2].set_title("Normal-heart estimate")
-    axes[3].plot(time, result.murmur_candidate, linewidth=0.7)
-    axes[3].set_title("Murmur candidate")
-    axes[4].plot(time, result.noise_candidate, linewidth=0.7)
-    axes[4].set_title("Noise/artifact candidate")
-    axes[5].plot(
+        axes[0].axvspan(start, end, alpha=0.16, color=color, label=phase)
+    if onset_seconds is not None and offset_seconds is not None:
+        axes[0].axvline(float(onset_seconds), color="tab:red", linestyle="--")
+        axes[0].axvline(float(offset_seconds), color="tab:red", linestyle="--")
+    axes[0].legend(loc="upper right", fontsize=8, ncol=4)
+    axes[0].set_title("Original phonocardiogram with cardiac phases")
+
+    axes[1].plot(
         time,
-        np.abs(hilbert(result.murmur_candidate)),
+        result.original,
         linewidth=0.6,
-        alpha=0.45,
-        label="raw Hilbert envelope",
+        color="0.65",
+        alpha=0.65,
+        label="original",
+    )
+    axes[1].plot(
+        time,
+        result.normal_estimate,
+        linewidth=0.8,
+        color="tab:blue",
+        label="normal-heart estimate",
+    )
+    axes[1].legend(loc="upper right", fontsize=8)
+    axes[1].set_title("Separation check: original vs normal-heart estimate")
+
+    axes[2].plot(
+        time, result.murmur_candidate, linewidth=0.65, label="murmur candidate"
     )
     observation_time = (
         np.arange(len(observation_candidate)) + observation_start
     ) / sample_rate
     smooth_envelope = smooth_amplitude_envelope(observation_candidate, sample_rate)
-    axes[5].plot(
+    axes[2].plot(
         observation_time,
         smooth_envelope,
         color="tab:red",
         linewidth=1.5,
-        label="smoothed detected interval",
+        label="smoothed envelope",
     )
     if len(smooth_envelope):
         peak_index = int(np.argmax(smooth_envelope))
-        axes[5].scatter(
+        axes[2].scatter(
             observation_time[peak_index],
             smooth_envelope[peak_index],
             color="black",
@@ -568,20 +867,60 @@ def _write_diagnostic_plot(
             zorder=3,
             label="envelope peak",
         )
-    axes[5].set_title(
-        "Amplitude envelope — "
+    axes[2].set_title(
+        f"{metadata.get('murmur_phase', 'Target-phase').title()} murmur and "
+        "amplitude envelope - "
         f"{result.metrics.get('envelope_shape', 'not characterized')}"
     )
-    axes[5].legend(loc="upper right", fontsize=8)
+    axes[2].legend(loc="upper right", fontsize=8)
     if onset_seconds is not None and offset_seconds is not None:
-        for axis in (axes[3], axes[5]):
-            axis.axvline(float(onset_seconds), color="tab:red", linestyle="--")
-            axis.axvline(float(offset_seconds), color="tab:red", linestyle="--")
-    axes[6].psd(
-        observation_candidate,
-        Fs=sample_rate,
-        NFFT=min(512, len(observation_candidate)),
+        axes[2].axvline(float(onset_seconds), color="tab:red", linestyle="--")
+        axes[2].axvline(float(offset_seconds), color="tab:red", linestyle="--")
+
+    amplitude_values = [
+        float(result.metrics.get("s1_reference_peak_abs", 0.0) or 0.0),
+        float(result.metrics.get("s2_reference_peak_abs", 0.0) or 0.0),
+        float(result.metrics.get("amplitude_peak_abs", 0.0) or 0.0),
+    ]
+    bars = axes[3].bar(
+        ["S1 original", "S2 original", "Murmur candidate"],
+        amplitude_values,
+        color=["tab:green", "tab:orange", "tab:red"],
     )
+    for bar, value in zip(bars, amplitude_values):
+        axes[3].text(
+            bar.get_x() + bar.get_width() / 2,
+            value,
+            f"{value:.3g}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    relative_percent = result.metrics.get(
+        "murmur_peak_relative_to_s1_s2_percent"
+    )
+    relative_text = (
+        "unavailable"
+        if relative_percent is None
+        else f"{float(relative_percent):.1f}% of mean S1/S2 peak"
+    )
+    axes[3].set_title(f"Paper-aligned relative amplitude - {relative_text}")
+    axes[3].set_ylabel("relative digital amplitude")
+
+    if len(observation_candidate) > 1:
+        psd_frequencies, psd_power = welch(
+            observation_candidate,
+            fs=sample_rate,
+            nperseg=min(512, len(observation_candidate)),
+            detrend="constant",
+        )
+        axes[4].plot(
+            psd_frequencies,
+            10 * np.log10(psd_power + 1e-12),
+            linewidth=1.0,
+        )
+    else:
+        axes[4].text(0.5, 0.5, "insufficient interval", ha="center", va="center")
     primary_frequency = float(
         result.metrics.get("psd_primary_peak_frequency_hz", 0.0) or 0.0
     )
@@ -589,7 +928,7 @@ def _write_diagnostic_plot(
         result.metrics.get("psd_secondary_peak_frequency_hz", 0.0) or 0.0
     )
     if primary_frequency > 0:
-        axes[6].axvline(
+        axes[4].axvline(
             primary_frequency,
             color="tab:red",
             linestyle="--",
@@ -597,19 +936,36 @@ def _write_diagnostic_plot(
             label=f"primary {primary_frequency:.0f} Hz",
         )
     if secondary_frequency > 0:
-        axes[6].axvline(
+        axes[4].axvline(
             secondary_frequency,
             color="tab:orange",
             linestyle=":",
             linewidth=1.0,
             label=f"secondary {secondary_frequency:.0f} Hz",
         )
-    axes[6].set_title(
-        "Detected interval PSD — "
+    low_frequency = float(
+        result.metrics.get("psd_low_frequency_limit_95_hz", 0.0) or 0.0
+    )
+    high_frequency = float(
+        result.metrics.get("psd_high_frequency_limit_95_hz", 0.0) or 0.0
+    )
+    if high_frequency > low_frequency > 0:
+        axes[4].axvspan(
+            low_frequency,
+            high_frequency,
+            color="tab:green",
+            alpha=0.12,
+            label=f"95% energy: {low_frequency:.0f}-{high_frequency:.0f} Hz",
+        )
+    axes[4].set_xlim(0, min(1000, sample_rate / 2))
+    axes[4].set_title(
+        "Murmur PSD - "
         f"{result.metrics.get('psd_morphology', 'not characterized')}"
     )
     if primary_frequency > 0:
-        axes[6].legend(loc="upper right", fontsize=8)
+        axes[4].legend(loc="upper right", fontsize=8)
+    axes[4].set_ylabel("power spectral density (dB/Hz)")
+
     frequencies, times, power = spectrogram(
         observation_candidate,
         fs=sample_rate,
@@ -622,7 +978,7 @@ def _write_diagnostic_plot(
             len(observation_candidate) / sample_rate / 2,
             1 / sample_rate,
         )
-        axes[7].imshow(
+        axes[5].imshow(
             power_db,
             origin="lower",
             aspect="auto",
@@ -634,12 +990,12 @@ def _write_diagnostic_plot(
             ),
         )
     else:
-        axes[7].pcolormesh(times, frequencies, power_db, shading="auto")
+        axes[5].pcolormesh(times, frequencies, power_db, shading="auto")
     ridge_times, ridge = dominant_frequency_trajectory(
         observation_candidate, sample_rate
     )
     if len(ridge_times):
-        axes[7].plot(
+        axes[5].plot(
             ridge_times + observation_start / sample_rate,
             ridge,
             color="white",
@@ -648,89 +1004,101 @@ def _write_diagnostic_plot(
             markersize=2,
             label="dominant-frequency trajectory",
         )
-        axes[7].legend(loc="upper right", fontsize=8)
-    axes[7].set_ylim(0, min(1000, sample_rate / 2))
-    axes[7].set_title(
-        "Detected interval spectrogram — frequency "
+        axes[5].legend(loc="upper right", fontsize=8)
+    axes[5].set_ylim(0, min(1000, sample_rate / 2))
+    axes[5].set_title(
+        "Murmur spectrogram - frequency "
         f"{result.metrics.get('time_frequency_ridge_direction', 'not characterized')}"
     )
-    assignments = result.assignments
-    axes[8].bar(
-        [row["component_index"] for row in result.component_features],
-        [row["relative_energy"] for row in result.component_features],
-        color=[
-            "tab:green"
-            if row["assignment"] == "normal"
-            else "tab:red"
-            if row["assignment"] == "murmur_candidate"
-            else "tab:gray"
-            for row in result.component_features
-        ],
+    wavelet_times, wavelet_frequencies, wavelet_power, wavelet_status = (
+        wavelet_scalogram(observation_candidate, sample_rate)
     )
-    axes[8].set_title("SSA component energy and assignment")
-    axes[8].set_xlabel("component")
-    axes[9].axis("off")
-    metric_lines = [
-        f"{key}: {value:.5g}" if isinstance(value, float) else f"{key}: {value}"
-        for key, value in result.metrics.items()
-        if key
-        in {
-            "reconstruction_error",
-            "normal_residual_correlation",
-            "murmur_region_energy_retention",
-            "s1_leakage_ratio",
-            "s2_leakage_ratio",
-            "outside_murmur_energy_ratio",
-            "noise_energy_ratio",
-            "onset_normalized",
-            "offset_normalized",
-            "selection_score",
-            "phase_selected_component_count",
-            "phase_rejected_component_count",
-            "phase_selection_used_fallback",
-            "candidate_quality_status",
-            "timing_quality_status",
-            "murmur_onset_recording_seconds",
-            "murmur_offset_recording_seconds",
-            "envelope_shape",
-            "envelope_time_to_peak_ratio",
-            "active_burst_count",
-            "active_time_ratio",
-            "psd_morphology",
-            "psd_primary_peak_frequency_hz",
-            "psd_primary_peak_width_hz",
-            "psd_prominent_peak_count",
-            "time_frequency_ridge_direction",
-            "time_frequency_ridge_slope_hz_per_second",
-            "time_frequency_ridge_variability_hz",
-        }
-    ]
-    def preview(indexes: list[int]) -> str:
-        suffix = "..." if len(indexes) > 12 else ""
-        return f"{indexes[:12]}{suffix}"
+    if wavelet_power.size:
+        axes[6].pcolormesh(
+            wavelet_times + observation_start / sample_rate,
+            wavelet_frequencies,
+            10 * np.log10(wavelet_power + 1e-12),
+            shading="auto",
+        )
+        axes[6].set_ylim(20, min(1000, sample_rate / 2))
+        axes[6].set_title("Murmur Morlet wavelet scalogram")
+    else:
+        axes[6].text(0.5, 0.5, wavelet_status, ha="center", va="center")
+        axes[6].set_title("Wavelet scalogram unavailable")
 
-    axes[9].text(
+    def format_metric(name: str, digits: int = 3) -> str:
+        value = result.metrics.get(name)
+        if value is None:
+            return "NA"
+        if isinstance(value, (float, np.floating)):
+            return f"{float(value):.{digits}g}"
+        return str(value)
+
+    axes[7].axis("off")
+    axes[7].text(
         0,
         1,
         "\n".join(
             [
-                metadata["recording_id"],
-                f"method: {result.selected_method}",
-                f"normal components: {preview(assignments['normal'])}",
-                f"murmur components: {preview(assignments['murmur_candidate'])}",
-                f"noise components: {preview(assignments['noise_artifact'])}",
-                *metric_lines,
+                "Observation summary",
+                f"clinical outcome: {metadata.get('clinical_outcome')}",
+                f"interpretation group: {metadata.get('interpretation_group')}",
+                f"method / quality: {result.selected_method} / "
+                f"{format_metric('candidate_quality_status')}",
+                f"phase / timing quality: {metadata.get('murmur_phase')} / "
+                f"{format_metric('timing_quality_status')}",
+                f"onset-offset (recording s): "
+                f"{format_metric('murmur_onset_recording_seconds', 5)} - "
+                f"{format_metric('murmur_offset_recording_seconds', 5)}",
+                f"duration (% target phase): "
+                f"{format_metric('murmur_duration_target_phase_percent', 4)}",
+                f"amplitude (% mean S1/S2 peak): "
+                f"{format_metric('murmur_peak_relative_to_s1_s2_percent', 4)}",
+                f"envelope: {format_metric('envelope_shape')}",
+                f"PSD: {format_metric('psd_morphology')}; primary "
+                f"{format_metric('psd_primary_peak_frequency_hz', 4)} Hz",
+                f"95% PSD range: {format_metric('psd_low_frequency_limit_95_hz', 4)} - "
+                f"{format_metric('psd_high_frequency_limit_95_hz', 4)} Hz",
+                f"frequency trajectory: "
+                f"{format_metric('time_frequency_ridge_direction')}",
+                f"boundary stability: "
+                f"{format_metric('boundary_stability_status')}",
+                "",
+                "CirCor expert reference",
+                f"timing: {metadata.get('expert_timing_label')} -> "
+                f"{format_metric('predicted_timing_label')}",
+                f"shape: {metadata.get('expert_shape_label')} -> "
+                f"{format_metric('predicted_shape_label')}",
+                f"pitch / grade / quality: {metadata.get('expert_pitch_label')} / "
+                f"{metadata.get('expert_grading_label')} / "
+                f"{metadata.get('expert_quality_label')}",
+                "",
+                "Separation audit",
+                f"outside-target energy: "
+                f"{format_metric('outside_murmur_energy_ratio', 4)}",
+                f"target retention: "
+                f"{format_metric('murmur_region_energy_retention', 4)}",
+                f"S1 / S2 leakage: {format_metric('s1_leakage_ratio', 4)} / "
+                f"{format_metric('s2_leakage_ratio', 4)}",
+                "Expert labels are semantic references,",
+                "not clean-source waveform ground truth.",
+                "Normal/abnormal outcome groups are report proxies,",
+                "not definitive innocent/pathological diagnoses.",
             ]
         ),
         va="top",
         family="monospace",
-        fontsize=9,
+        fontsize=9.5,
     )
-    for axis in axes[:6]:
+
+    for axis in axes[:3]:
         axis.set_xlabel("seconds")
-    axes[6].set_xlabel("frequency (Hz)")
-    axes[7].set_xlabel("seconds")
-    figure.tight_layout(pad=1.2)
+    axes[4].set_xlabel("frequency (Hz)")
+    axes[5].set_xlabel("seconds")
+    axes[5].set_ylabel("frequency (Hz)")
+    axes[6].set_xlabel("seconds")
+    axes[6].set_ylabel("frequency (Hz)")
+    figure.tight_layout(rect=(0, 0, 1, 0.97), pad=1.2)
     figure.savefig(destination, dpi=140)
     plt.close(figure)
 
@@ -791,6 +1159,7 @@ def summarize_audit_quality(summary: pd.DataFrame) -> pd.DataFrame:
     """Aggregate accepted and low-confidence candidates without mixing them."""
 
     columns = [
+        "murmur_phase",
         "candidate_quality_status",
         "murmur_label",
         "audit_outcome",
@@ -820,14 +1189,25 @@ def summarize_audit_quality(summary: pd.DataFrame) -> pd.DataFrame:
                 table["murmur_label"], table["candidate_quality_status"]
             )
         ]
+    group_columns = [
+        column
+        for column in (
+            "murmur_phase",
+            "candidate_quality_status",
+            "murmur_label",
+            "audit_outcome",
+        )
+        if column in table
+    ]
     grouped = table.groupby(
-        ["candidate_quality_status", "murmur_label", "audit_outcome"],
+        group_columns,
         dropna=False,
         sort=True,
     )
     counts = grouped.size().rename("segment_count")
     means = grouped[metrics].mean()
-    return pd.concat([counts, means], axis=1).reset_index()[columns]
+    result = pd.concat([counts, means], axis=1).reset_index()
+    return result[[column for column in columns if column in result]]
 
 
 def run_audit(
@@ -841,6 +1221,8 @@ def run_audit(
     all_recordings: bool = False,
     output_profile: str = "full",
     resume: bool = False,
+    target_phase: str = "auto",
+    recording_ids: list[str] | None = None,
 ) -> pd.DataFrame:
     if limit < 0:
         raise ValueError("limit must be non-negative; use 0 for no limit")
@@ -850,17 +1232,29 @@ def run_audit(
         )
     if output_profile not in {"full", "accepted", "summary"}:
         raise ValueError("output_profile must be full, accepted, or summary")
+    if target_phase not in {"auto", "systole", "diastole"}:
+        raise ValueError("target_phase must be auto, systole, or diastole")
     if resume and not run_name:
         raise ValueError("resume requires a run_name to identify its checkpoint")
     ensure_output_directories()
     if validate_first:
         validate_dataset()
     metadata_table = pd.read_csv(METADATA_PATH, dtype={"Patient ID": str})
-    recordings = (
-        _all_recordings(metadata_table, limit)
-        if all_recordings
-        else _representative_recordings(metadata_table, limit)
-    )
+    recording_filter = sorted(set(recording_ids or []))
+    if recording_filter:
+        available = {
+            row["recording_id"]: row for row in _all_recordings(metadata_table, 0)
+        }
+        missing = [name for name in recording_filter if name not in available]
+        if missing:
+            raise ValueError(f"recording IDs are unavailable or unpaired: {missing}")
+        recordings = [available[name] for name in recording_filter]
+    else:
+        recordings = (
+            _all_recordings(metadata_table, limit)
+            if all_recordings
+            else _representative_recordings(metadata_table, limit)
+        )
     suffix = f"_{run_name}" if run_name else ""
     checkpoint_path = REPORT_OUTPUT_DIR / f"separation_checkpoint{suffix}.csv"
     summary_rows: list[dict[str, Any]] = []
@@ -873,6 +1267,8 @@ def run_audit(
                 "requested_method": str,
                 "recording_scope": str,
                 "output_profile": str,
+                "target_phase_request": str,
+                "recording_filter": str,
             },
         )
         if "config_hash" in checkpoint and not checkpoint.empty:
@@ -885,6 +1281,8 @@ def run_audit(
             "requested_method": method,
             "recording_scope": "all" if all_recordings else "representative",
             "output_profile": output_profile,
+            "target_phase_request": target_phase,
+            "recording_filter": ",".join(recording_filter),
         }
         if not checkpoint.empty:
             missing_identity = set(expected_identity) - set(checkpoint.columns)
@@ -900,7 +1298,11 @@ def run_audit(
                     )
         summary_rows = checkpoint.to_dict(orient="records")
     completed = {
-        (str(row["recording_id"]), int(row["cycle_index"]))
+        (
+            str(row["recording_id"]),
+            int(row["cycle_index"]),
+            str(row.get("murmur_phase", "systole")),
+        )
         for row in summary_rows
         if "recording_id" in row and "cycle_index" in row
     }
@@ -929,8 +1331,6 @@ def run_audit(
         if cycles_per_recording > 0:
             systole_positions = systole_positions[:cycles_per_recording]
         for cycle_index, systole_position in enumerate(systole_positions):
-            if (recording_id, cycle_index) in completed:
-                continue
             try:
                 cycle = build_cardiac_cycle_context(
                     signal, annotations, int(systole_position), sample_rate
@@ -941,75 +1341,85 @@ def run_audit(
                     {**recording, "cycle_index": cycle_index, "reason": str(exc)}
                 )
                 continue
-            if method == "auto":
-                result, _ = compare_separation_methods(
-                    cycle.signal, config=config, phase_masks=cycle.phase_masks
+            for murmur_phase in _target_phases_for_recording(
+                recording, target_phase
+            ):
+                identity = (recording_id, cycle_index, murmur_phase)
+                if identity in completed:
+                    continue
+                phase_metadata = _target_phase_metadata(recording, murmur_phase)
+                if method == "auto":
+                    result, _ = compare_separation_methods(
+                        cycle.signal,
+                        config=config,
+                        phase_masks=cycle.phase_masks,
+                        target_phase=murmur_phase,
+                    )
+                else:
+                    result = separate_signal(
+                        cycle.signal,
+                        config=config,
+                        method=method,
+                        phase_masks=cycle.phase_masks,
+                        target_phase=murmur_phase,
+                    )
+                result.metrics.update(
+                    _absolute_timing_metrics(
+                        result.metrics, cycle, sample_rate, murmur_phase
+                    )
                 )
-            else:
-                result = separate_signal(
-                    cycle.signal,
-                    config=config,
-                    method=method,
-                    phase_masks=cycle.phase_masks,
+                result.metrics.update(
+                    _expert_agreement_metrics(
+                        result.metrics, phase_metadata, murmur_phase
+                    )
                 )
-            result.metrics.update(
-                real_proxy_metrics(
-                    result.original,
-                    result.normal_estimate,
-                    result.murmur_candidate,
-                    result.noise_candidate,
-                    sample_rate,
-                    threshold_mad=config.onset_threshold_mad,
-                    minimum_duration_ms=config.minimum_interval_duration_ms,
-                    merge_gap_ms=config.gap_merging_duration_ms,
-                    phase_masks=cycle.phase_masks,
+                segment_metadata: dict[str, Any] = {
+                    **recording,
+                    **phase_metadata,
+                    "cycle_index": cycle_index,
+                    "phase": "complete_cycle",
+                    "context_start_sample": cycle.context_start_sample,
+                    "context_end_sample": cycle.context_end_sample,
+                    "sample_rate": sample_rate,
+                    "config_hash": config.config_hash,
+                    "requested_method": method,
+                    "target_phase_request": target_phase,
+                    "recording_filter": ",".join(recording_filter),
+                    "separation_method": result.selected_method,
+                    "recording_scope": (
+                        "all" if all_recordings else "representative"
+                    ),
+                    "output_profile": output_profile,
+                }
+                for phase, (relative_start, relative_end) in cycle.phase_bounds.items():
+                    segment_metadata[f"{phase}_relative_start_sample"] = relative_start
+                    segment_metadata[f"{phase}_relative_end_sample"] = relative_end
+                    segment_metadata[f"{phase}_absolute_start_sample"] = (
+                        cycle.context_start_sample + relative_start
+                    )
+                    segment_metadata[f"{phase}_absolute_end_sample"] = (
+                        cycle.context_start_sample + relative_end
+                    )
+                segment_metadata["audit_outcome"] = classify_audit_outcome(
+                    str(phase_metadata["murmur_label"]),
+                    str(result.metrics["candidate_quality_status"]),
                 )
-            )
-            result.metrics.update(
-                _absolute_timing_metrics(result.metrics, cycle, sample_rate)
-            )
-            segment_metadata: dict[str, Any] = {
-                **recording,
-                "cycle_index": cycle_index,
-                "phase": "complete_cycle",
-                "context_start_sample": cycle.context_start_sample,
-                "context_end_sample": cycle.context_end_sample,
-                "sample_rate": sample_rate,
-                "config_hash": config.config_hash,
-                "requested_method": method,
-                "separation_method": result.selected_method,
-                "recording_scope": "all" if all_recordings else "representative",
-                "output_profile": output_profile,
-            }
-            for phase, (relative_start, relative_end) in cycle.phase_bounds.items():
-                segment_metadata[f"{phase}_relative_start_sample"] = relative_start
-                segment_metadata[f"{phase}_relative_end_sample"] = relative_end
-                segment_metadata[f"{phase}_absolute_start_sample"] = (
-                    cycle.context_start_sample + relative_start
+                directory = (
+                    output_root
+                    / recording_id
+                    / f"cycle_{cycle_index}_{murmur_phase}_context"
                 )
-                segment_metadata[f"{phase}_absolute_end_sample"] = (
-                    cycle.context_start_sample + relative_end
-                )
-            segment_metadata["audit_outcome"] = classify_audit_outcome(
-                str(recording["murmur_label"]),
-                str(result.metrics["candidate_quality_status"]),
-            )
-            directory = (
-                output_root
-                / recording_id
-                / f"cycle_{cycle_index}_context"
-            )
-            quality_status = str(result.metrics["candidate_quality_status"])
-            save_package = _should_save_package(output_profile, quality_status)
-            if save_package:
-                metrics = _save_segment_package(
-                    result, directory, segment_metadata, config
-                )
-            else:
-                metrics = {**segment_metadata, **result.metrics}
-            metrics["package_saved"] = save_package
-            summary_rows.append(metrics)
-            completed.add((recording_id, cycle_index))
+                quality_status = str(result.metrics["candidate_quality_status"])
+                save_package = _should_save_package(output_profile, quality_status)
+                if save_package:
+                    metrics = _save_segment_package(
+                        result, directory, segment_metadata, config
+                    )
+                else:
+                    metrics = {**segment_metadata, **result.metrics}
+                metrics["package_saved"] = save_package
+                summary_rows.append(metrics)
+                completed.add(identity)
         _write_checkpoint(summary_rows, checkpoint_path)
         if recording_number % 25 == 0 or recording_number == len(recordings):
             print(
@@ -1043,7 +1453,19 @@ def run_audit(
         "recording_id",
         "location",
         "cycle_index",
+        "murmur_phase",
+        "clinical_outcome",
+        "interpretation_group",
         "timing_label",
+        "expert_timing_label",
+        "expert_shape_label",
+        "expert_pitch_label",
+        "expert_grading_label",
+        "expert_quality_label",
+        "predicted_timing_label",
+        "predicted_shape_label",
+        "timing_label_agreement",
+        "shape_label_agreement",
         "candidate_quality_status",
         "timing_quality_status",
         "activity_detection_method",
@@ -1060,6 +1482,17 @@ def run_audit(
     )
     summarize_murmur_morphology_categories(summary).to_csv(
         REPORT_OUTPUT_DIR / f"murmur_morphology_summary{suffix}.csv", index=False
+    )
+    expert_columns = [
+        column
+        for column in observation_columns
+        if column in present_accepted
+    ]
+    present_accepted[expert_columns].to_csv(
+        REPORT_OUTPUT_DIR / f"murmur_expert_comparison{suffix}.csv", index=False
+    )
+    summarize_expert_agreement(summary).to_csv(
+        REPORT_OUTPUT_DIR / f"murmur_expert_agreement{suffix}.csv", index=False
     )
     skipped = pd.DataFrame(skipped_rows)
     if skipped.empty:
@@ -1078,6 +1511,8 @@ def run_audit(
         "recording_limit": limit,
         "cycles_per_recording": cycles_per_recording,
         "method": method,
+        "target_phase": target_phase,
+        "recording_filter": recording_filter,
         "output_profile": output_profile,
         "resume": resume,
         "selected_recordings": len(recordings),
@@ -1115,6 +1550,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Resume completed recording/cycle pairs from the run checkpoint",
     )
     parser.add_argument("--method", choices=["auto", "zcr", "kurtosis"], default="auto")
+    parser.add_argument(
+        "--target-phase",
+        choices=["auto", "systole", "diastole"],
+        default="auto",
+        help=(
+            "Choose the murmur phase; auto uses expert phase metadata for Present "
+            "recordings and both phases for controls"
+        ),
+    )
+    parser.add_argument(
+        "--recording-id",
+        action="append",
+        default=[],
+        help=(
+            "Process one exact recording ID; repeat this option for a focused pilot"
+        ),
+    )
     parser.add_argument("--energy-threshold", type=float, default=0.99)
     parser.add_argument(
         "--ssa-window-length",
@@ -1160,6 +1612,8 @@ def main(argv: list[str] | None = None) -> int:
         all_recordings=args.all_recordings,
         output_profile=args.output_profile,
         resume=args.resume,
+        target_phase=args.target_phase,
+        recording_ids=args.recording_id,
     )
     print(f"Processed segments: {len(summary)}")
     if "candidate_quality_status" in summary:
@@ -1187,6 +1641,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Morphology summary: "
         f"{REPORT_OUTPUT_DIR / f'murmur_morphology_summary{suffix}.csv'}"
+    )
+    print(
+        "Expert agreement: "
+        f"{REPORT_OUTPUT_DIR / f'murmur_expert_agreement{suffix}.csv'}"
     )
     return 0
 

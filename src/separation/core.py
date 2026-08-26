@@ -12,6 +12,9 @@ from src.ssa import SSAResult, ssa_decompose_audited
 from .metrics import EPSILON, energy, real_proxy_metrics, safe_correlation, spectral_features
 
 
+MURMUR_TARGET_PHASES = ("systole", "diastole")
+
+
 @dataclass(frozen=True)
 class SeparationResult:
     original: np.ndarray
@@ -78,10 +81,13 @@ def _phase_energy_features(
         features[f"{phase}_energy_fraction"] = phase_energy / component_energy
         features[f"{phase}_energy_density"] = densities[phase]
     density_total = sum(densities.values()) + EPSILON
-    features["systole_focus_score"] = densities["systole"] / density_total
-    features["systole_to_s1_s2_ratio"] = densities["systole"] / (
-        densities["s1"] + densities["s2"] + EPSILON
-    )
+    for target_phase in MURMUR_TARGET_PHASES:
+        features[f"{target_phase}_focus_score"] = (
+            densities[target_phase] / density_total
+        )
+        features[f"{target_phase}_to_s1_s2_ratio"] = densities[target_phase] / (
+            densities["s1"] + densities["s2"] + EPSILON
+        )
     return features
 
 
@@ -210,14 +216,20 @@ def _phase_aware_murmur_indexes(
     rows: list[dict[str, Any]],
     provisional_indexes: list[int],
     config: SeparationConfig,
+    target_phase: str = "systole",
 ) -> tuple[list[int], list[int], bool]:
     """Filter provisional murmur components using full-cycle phase energy."""
+
+    if target_phase not in MURMUR_TARGET_PHASES:
+        raise ValueError(f"target_phase must be one of {MURMUR_TARGET_PHASES}")
+    focus_key = f"{target_phase}_focus_score"
+    heart_sound_ratio_key = f"{target_phase}_to_s1_s2_ratio"
 
     selected = [
         index
         for index in provisional_indexes
-        if rows[index]["systole_focus_score"] >= config.minimum_systole_focus
-        and rows[index]["systole_to_s1_s2_ratio"]
+        if rows[index][focus_key] >= config.minimum_systole_focus
+        and rows[index][heart_sound_ratio_key]
         >= config.minimum_systole_to_s1_s2_ratio
     ]
     used_fallback = False
@@ -226,8 +238,8 @@ def _phase_aware_murmur_indexes(
             max(
                 provisional_indexes,
                 key=lambda index: (
-                    rows[index]["systole_focus_score"],
-                    rows[index]["systole_to_s1_s2_ratio"],
+                    rows[index][focus_key],
+                    rows[index][heart_sound_ratio_key],
                     rows[index]["relative_energy"],
                 ),
             )
@@ -252,9 +264,12 @@ def separate_signal(
     config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
     method: str = "zcr",
     phase_masks: dict[str, np.ndarray] | None = None,
+    target_phase: str = "systole",
 ) -> SeparationResult:
     """Separate one cardiac-phase segment into normal, murmur, and noise candidates."""
 
+    if target_phase not in MURMUR_TARGET_PHASES:
+        raise ValueError(f"target_phase must be one of {MURMUR_TARGET_PHASES}")
     values = np.asarray(signal, dtype=float)
     validated_phase_masks = _validate_phase_masks(phase_masks, len(values))
     window = min(config.ssa_window_length, max(2, len(values) // 4))
@@ -300,7 +315,9 @@ def separate_signal(
             murmur_indexes,
             phase_rejected_indexes,
             phase_selection_used_fallback,
-        ) = _phase_aware_murmur_indexes(rows, provisional_murmur_indexes, config)
+        ) = _phase_aware_murmur_indexes(
+            rows, provisional_murmur_indexes, config, target_phase
+        )
         normal_indexes = sorted(normal_indexes + phase_rejected_indexes)
     else:
         murmur_indexes = provisional_murmur_indexes
@@ -348,6 +365,7 @@ def separate_signal(
         minimum_duration_ms=config.minimum_interval_duration_ms,
         merge_gap_ms=config.gap_merging_duration_ms,
         phase_masks=validated_phase_masks,
+        target_phase=target_phase,
     )
     metrics.update(
         {
@@ -363,6 +381,12 @@ def separate_signal(
             "phase_selected_component_count": len(murmur_indexes),
             "phase_rejected_component_count": len(phase_rejected_indexes),
             "phase_selection_used_fallback": phase_selection_used_fallback,
+            "murmur_phase": target_phase,
+            "phase_threshold_scope": (
+                "systolic_tuned"
+                if target_phase == "systole"
+                else "diastolic_experimental"
+            ),
             "candidate_quality_status": (
                 "not_assessed"
                 if validated_phase_masks is None
@@ -409,12 +433,17 @@ def compare_separation_methods(
     *,
     config: SeparationConfig = DEFAULT_SEPARATION_CONFIG,
     phase_masks: dict[str, np.ndarray] | None = None,
+    target_phase: str = "systole",
 ) -> tuple[SeparationResult, dict[str, SeparationResult]]:
     """Choose between configured methods with a multi-metric plausibility score."""
 
     candidates = {
         method: separate_signal(
-            signal, config=config, method=method, phase_masks=phase_masks
+            signal,
+            config=config,
+            method=method,
+            phase_masks=phase_masks,
+            target_phase=target_phase,
         )
         for method in ("zcr", "kurtosis")
     }

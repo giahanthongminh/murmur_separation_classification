@@ -28,6 +28,7 @@ from config import (
 
 VALID_CARDIAC_STATES = {0, 1, 2, 3, 4}
 REQUIRED_CARDIAC_STATES = {1, 2, 3, 4}
+METADATA_LOCATION_COLUMNS = ("Recording locations:", "Locations")
 
 
 class DatasetValidationError(RuntimeError):
@@ -54,11 +55,21 @@ def _read_annotation(path: Path) -> pd.DataFrame:
     return table
 
 
+def _metadata_location_column(metadata: pd.DataFrame) -> str | None:
+    return next(
+        (name for name in METADATA_LOCATION_COLUMNS if name in metadata.columns),
+        None,
+    )
+
+
 def _metadata_references(metadata: pd.DataFrame) -> set[str]:
     references: set[str] = set()
+    location_column = _metadata_location_column(metadata)
+    if location_column is None:
+        return references
     for _, row in metadata.iterrows():
         patient_id = str(row["Patient ID"]).strip()
-        locations = str(row.get("Locations", "")).strip()
+        locations = str(row.get(location_column, "")).strip()
         if not locations or locations.lower() == "nan":
             continue
         for location in locations.split("+"):
@@ -152,7 +163,9 @@ def validate_dataset(
         try:
             metadata = pd.read_csv(metadata_path, dtype={"Patient ID": str})
             report["patients"] = len(metadata)
-            if "Patient ID" not in metadata.columns or "Locations" not in metadata.columns:
+            location_column = _metadata_location_column(metadata)
+            report["metadata_location_column"] = location_column
+            if "Patient ID" not in metadata.columns or location_column is None:
                 add_error("invalid_metadata_columns", list(metadata.columns))
             elif metadata["Patient ID"].duplicated().any():
                 duplicate_patients = metadata.loc[
@@ -244,7 +257,11 @@ def validate_dataset(
         if values:
             add_error(code, values[:20])
 
-    if metadata is not None and {"Patient ID", "Locations"}.issubset(metadata.columns):
+    if (
+        metadata is not None
+        and "Patient ID" in metadata.columns
+        and _metadata_location_column(metadata) is not None
+    ):
         references = _metadata_references(metadata)
         recording_references = {
             _metadata_reference_for_recording(recording_id) for recording_id in wav_ids
