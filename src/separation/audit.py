@@ -39,6 +39,7 @@ from src.separation.metrics import (
     smooth_amplitude_envelope,
     wavelet_scalogram,
 )
+from src.separation.tier_a_features import TIER_A_EXPORT_COLUMNS
 
 
 OBSERVATION_METRICS = [
@@ -137,6 +138,7 @@ OBSERVATION_METRICS = [
     "boundary_psd_width_relative_range",
     "boundary_envelope_shape_agreement_ratio",
     "boundary_stability_status",
+    *TIER_A_EXPORT_COLUMNS,
 ]
 
 

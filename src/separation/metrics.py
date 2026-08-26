@@ -7,9 +7,13 @@ from scipy.signal import (
     find_peaks,
     hilbert,
     peak_widths,
-    savgol_filter,
     spectrogram,
     welch,
+)
+
+from src.separation.tier_a_features import (
+    extract_tier_a_features,
+    smoothed_hilbert_envelope,
 )
 
 
@@ -19,19 +23,8 @@ EPSILON = 1e-12
 def smooth_amplitude_envelope(signal: np.ndarray, sample_rate: int) -> np.ndarray:
     """Return a deterministic short-window envelope for morphology analysis."""
 
-    values = np.asarray(signal, dtype=float)
-    if values.size == 0:
-        return np.asarray([], dtype=float)
-    envelope = np.abs(hilbert(values)) if len(values) > 2 else np.abs(values)
-    if len(values) < 5:
-        return envelope
-    window = min(
-        len(values) if len(values) % 2 else len(values) - 1,
-        max(5, int(round(sample_rate * 0.012)) | 1),
-    )
-    if window < 5:
-        return envelope
-    return np.maximum(savgol_filter(envelope, window, 2, mode="interp"), 0.0)
+    envelope, _, _ = smoothed_hilbert_envelope(signal, sample_rate)
+    return envelope
 
 
 def dominant_frequency_trajectory(
@@ -790,6 +783,8 @@ def real_proxy_metrics(
     )
     s1_reference_peak_abs: float | None = None
     s2_reference_peak_abs: float | None = None
+    s1_reference_values: np.ndarray | None = None
+    s2_reference_values: np.ndarray | None = None
     if phase_masks is None:
         timing_candidate = np.asarray(murmur_candidate)
         murmur_region_energy_retention = energy(murmur_candidate) / (
@@ -809,6 +804,8 @@ def real_proxy_metrics(
         target_mask = systole_mask if target_phase == "systole" else diastole_mask
         candidate_values = np.asarray(murmur_candidate)
         original_values = np.asarray(original)
+        s1_reference_values = original_values[s1_mask]
+        s2_reference_values = original_values[s2_mask]
         s1_reference_peak_abs = float(np.max(np.abs(original_values[s1_mask])))
         s2_reference_peak_abs = float(np.max(np.abs(original_values[s2_mask])))
         timing_candidate = candidate_values[target_mask]
@@ -860,6 +857,16 @@ def real_proxy_metrics(
             s1_s2_reference_peak_abs + EPSILON
         )
     observation = murmur_observation_features(observation_candidate, sample_rate)
+    tier_a = extract_tier_a_features(
+        observation_candidate,
+        sample_rate,
+        phase_start_sample=0,
+        phase_end_sample=len(timing_candidate),
+        onset_sample=None if onset is None else int(onset),
+        offset_sample=None if offset is None else int(offset),
+        s1_reference=s1_reference_values,
+        s2_reference=s2_reference_values,
+    )
     robustness = boundary_robustness_metrics(
         timing_candidate,
         sample_rate,
@@ -898,6 +905,7 @@ def real_proxy_metrics(
         "residual_spectral_entropy": spectral["spectral_entropy"],
         "residual_dominant_frequency": spectral["dominant_frequency"],
         **observation,
+        **tier_a,
         **robustness,
         **timing,
     }
