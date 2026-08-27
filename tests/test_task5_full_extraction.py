@@ -148,8 +148,36 @@ def test_recording_and_patient_location_aggregates_use_cycle_medians() -> None:
     patient = aggregate_features_long(table, level="patient_location")
     assert set(patient["aggregation_level"]) == {"patient_location"}
 
+    # Patient/location aggregation must weight recording medians equally rather
+    # than pooling cycles and overweighting a recording with more cycles.
+    repeated_rows = []
+    for cycle in range(5):
+        row = _row(20 + cycle)
+        row.update(
+            patient_id="repeated",
+            recording_id="repeated_AV_1",
+            cycle_index=cycle,
+        )
+        row[feature] = 100.0
+        repeated_rows.append(row)
+    second = _row(30)
+    second.update(
+        patient_id="repeated",
+        recording_id="repeated_AV_2",
+        cycle_index=0,
+    )
+    second[feature] = 0.0
+    repeated_rows.append(second)
+    repeated = build_feature_table(pd.DataFrame(repeated_rows))
+    patient = aggregate_features_long(repeated, level="patient_location")
+    result = patient.loc[patient["feature"].eq(feature)].iloc[0]
+    assert result["attempted_recording_count"] == 2
+    assert result["attempted_cycle_count"] == 6
+    assert result["median"] == pytest.approx(50.0)
+
 
 def test_full_extraction_configuration_rejects_method_drift() -> None:
     with pytest.raises(ValueError, match="method"):
         FullExtractionConfig(method="auto")
     assert FullExtractionConfig().cycles_per_recording == 0
+    assert FullExtractionConfig().checkpoint_interval_recordings == 25

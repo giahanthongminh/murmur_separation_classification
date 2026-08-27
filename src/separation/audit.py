@@ -1226,6 +1226,7 @@ def run_audit(
     excluded_recording_ids: list[str] | None = None,
     report_output_dir: Path = REPORT_OUTPUT_DIR,
     separation_output_dir: Path = SEPARATION_OUTPUT_DIR,
+    checkpoint_interval_recordings: int = 1,
 ) -> pd.DataFrame:
     if limit < 0:
         raise ValueError("limit must be non-negative; use 0 for no limit")
@@ -1239,6 +1240,8 @@ def run_audit(
         raise ValueError("target_phase must be auto, systole, or diastole")
     if resume and not run_name:
         raise ValueError("resume requires a run_name to identify its checkpoint")
+    if checkpoint_interval_recordings < 1:
+        raise ValueError("checkpoint_interval_recordings must be positive")
     ensure_output_directories()
     report_output_dir = Path(report_output_dir).expanduser().resolve()
     separation_output_dir = Path(separation_output_dir).expanduser().resolve()
@@ -1348,6 +1351,15 @@ def run_audit(
     output_root = (
         separation_output_dir / run_name if run_name else separation_output_dir
     )
+
+    def persist_checkpoints() -> None:
+        _write_checkpoint(summary_rows, checkpoint_path)
+        _write_checkpoint(skipped_rows, skipped_checkpoint_path)
+        _write_checkpoint(
+            [{"recording_id": value} for value in sorted(completed_recordings)],
+            recording_checkpoint_path,
+        )
+
     for recording_number, recording in enumerate(recordings, start=1):
         recording_id = recording["recording_id"]
         if str(recording_id) in completed_recordings:
@@ -1366,12 +1378,12 @@ def run_audit(
             message = f"recording load failed: {exc}"
             print(f"Skipping {recording_id}: {message}")
             skipped_rows.append({**recording, "cycle_index": None, "reason": message})
-            _write_checkpoint(skipped_rows, skipped_checkpoint_path)
             completed_recordings.add(str(recording_id))
-            _write_checkpoint(
-                [{"recording_id": value} for value in sorted(completed_recordings)],
-                recording_checkpoint_path,
-            )
+            if (
+                recording_number % checkpoint_interval_recordings == 0
+                or recording_number == len(recordings)
+            ):
+                persist_checkpoints()
             continue
         systole_positions = np.flatnonzero(annotations["state"].to_numpy() == 2)
         if cycles_per_recording > 0:
@@ -1467,13 +1479,12 @@ def run_audit(
                 metrics["package_saved"] = save_package
                 summary_rows.append(metrics)
                 completed.add(identity)
-        _write_checkpoint(summary_rows, checkpoint_path)
-        _write_checkpoint(skipped_rows, skipped_checkpoint_path)
         completed_recordings.add(str(recording_id))
-        _write_checkpoint(
-            [{"recording_id": value} for value in sorted(completed_recordings)],
-            recording_checkpoint_path,
-        )
+        if (
+            recording_number % checkpoint_interval_recordings == 0
+            or recording_number == len(recordings)
+        ):
+            persist_checkpoints()
         if recording_number % 25 == 0 or recording_number == len(recordings):
             print(
                 f"Completed recordings: {recording_number}/{len(recordings)}; "
@@ -1569,6 +1580,7 @@ def run_audit(
         "excluded_recording_filter": excluded_recording_filter,
         "output_profile": output_profile,
         "resume": resume,
+        "checkpoint_interval_recordings": checkpoint_interval_recordings,
         "selected_recordings": len(recordings),
         "processed_segments": len(summary),
         "skipped_segments_or_recordings": len(skipped_rows),

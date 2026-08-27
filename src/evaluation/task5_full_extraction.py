@@ -42,7 +42,7 @@ from src.separation.tier_a_features import (
 )
 
 
-TOOL_VERSION: Final = "task5-phase2a-full-extraction-v1.0.0"
+TOOL_VERSION: Final = "task5-phase2a-full-extraction-v1.0.1"
 DEFAULT_OUTPUT_ROOT: Final = OUTPUT_ROOT / "task5_full_extraction"
 KNOWN_UNUSABLE_ANNOTATIONS: Final[tuple[str, ...]] = (
     "50150_MV.tsv",
@@ -103,6 +103,7 @@ class FullExtractionConfig:
     target_phase: str = "auto"
     output_profile: str = "summary"
     recording_limit: int = 0
+    checkpoint_interval_recordings: int = 25
 
     def __post_init__(self) -> None:
         if self.method not in {"zcr", "kurtosis"}:
@@ -115,6 +116,8 @@ class FullExtractionConfig:
             raise ValueError("invalid output_profile")
         if self.recording_limit < 0:
             raise ValueError("recording_limit must be non-negative")
+        if self.checkpoint_interval_recordings < 1:
+            raise ValueError("checkpoint_interval_recordings must be positive")
 
 
 def _sha256_file(path: Path) -> str:
@@ -326,15 +329,12 @@ def aggregate_features_long(
 ) -> pd.DataFrame:
     """Aggregate cycles using medians while retaining attempts and dispersion."""
 
-    if level == "recording":
-        group_columns = ["patient_id", "recording_id", "location", "murmur_phase"]
-    elif level == "patient_location":
-        group_columns = ["patient_id", "location", "murmur_phase"]
-    else:
+    if level not in {"recording", "patient_location"}:
         raise ValueError("level must be recording or patient_location")
+    recording_groups = ["patient_id", "recording_id", "location", "murmur_phase"]
     rows: list[dict[str, Any]] = []
-    for keys, group in table.groupby(group_columns, sort=True, dropna=False):
-        identity = dict(zip(group_columns, keys, strict=True))
+    for keys, group in table.groupby(recording_groups, sort=True, dropna=False):
+        identity = dict(zip(recording_groups, keys, strict=True))
         for feature in TIER_A_FEATURE_COLUMNS:
             valid = group[f"{feature}_valid"].fillna(False).astype(bool)
             values = pd.to_numeric(group.loc[valid, feature], errors="coerce").dropna()
@@ -344,6 +344,9 @@ def aggregate_features_long(
                     "aggregation_level": level,
                     "feature": feature,
                     "unit": TIER_A_FEATURE_UNITS[feature],
+                    "attempted_recording_count": 1,
+                    "valid_recording_count": int(bool(len(values))),
+                    "valid_recording_fraction": float(bool(len(values))),
                     "attempted_cycle_count": int(len(group)),
                     "valid_cycle_count": int(len(values)),
                     "valid_fraction": float(len(values) / len(group)),
@@ -353,7 +356,40 @@ def aggregate_features_long(
                     "iqr": float(values.quantile(.75) - values.quantile(.25)) if len(values) else np.nan,
                 }
             )
-    return pd.DataFrame(rows)
+    recording = pd.DataFrame(rows)
+    if level == "recording":
+        return recording
+
+    patient_rows: list[dict[str, Any]] = []
+    patient_groups = ["patient_id", "location", "murmur_phase", "feature", "unit"]
+    for keys, group in recording.groupby(patient_groups, sort=True, dropna=False):
+        identity = dict(zip(patient_groups, keys, strict=True))
+        recording_medians = pd.to_numeric(group["median"], errors="coerce").dropna()
+        attempted_recordings = int(len(group))
+        valid_recordings = int(len(recording_medians))
+        attempted_cycles = int(group["attempted_cycle_count"].sum())
+        valid_cycles = int(group["valid_cycle_count"].sum())
+        patient_rows.append(
+            {
+                **identity,
+                "aggregation_level": "patient_location",
+                "attempted_recording_count": attempted_recordings,
+                "valid_recording_count": valid_recordings,
+                "valid_recording_fraction": valid_recordings / attempted_recordings,
+                "attempted_cycle_count": attempted_cycles,
+                "valid_cycle_count": valid_cycles,
+                "valid_fraction": valid_cycles / attempted_cycles,
+                "median": float(recording_medians.median()) if valid_recordings else np.nan,
+                "q25": float(recording_medians.quantile(.25)) if valid_recordings else np.nan,
+                "q75": float(recording_medians.quantile(.75)) if valid_recordings else np.nan,
+                "iqr": (
+                    float(recording_medians.quantile(.75) - recording_medians.quantile(.25))
+                    if valid_recordings
+                    else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(patient_rows)
 
 
 def write_phase2a_artifacts(
@@ -528,6 +564,7 @@ def run_full_extraction(
         excluded_recording_ids=excluded,
         report_output_dir=reports,
         separation_output_dir=packages,
+        checkpoint_interval_recordings=extraction_config.checkpoint_interval_recordings,
     )
     suffix = f"_{run_name}"
     skipped_path = reports / f"separation_skipped{suffix}.csv"
@@ -558,11 +595,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recording-limit", type=int, default=0)
     parser.add_argument("--cycles-per-recording", type=int, default=0)
     parser.add_argument("--method", choices=["zcr", "kurtosis"], default="zcr")
+    parser.add_argument("--checkpoint-interval-recordings", type=int, default=25)
     args = parser.parse_args(argv)
     extraction_config = FullExtractionConfig(
         method=args.method,
         cycles_per_recording=args.cycles_per_recording,
         recording_limit=args.recording_limit,
+        checkpoint_interval_recordings=args.checkpoint_interval_recordings,
     )
     destination = run_full_extraction(
         run_name=args.run_name,
