@@ -102,10 +102,9 @@ digital full scale and should not be interpreted as calibrated sound pressure
 or compared clinically across recording devices. The morphology labels are
 reproducible descriptive rules, not diagnoses or classifier ground truth.
 For interpretation, the exports also retain CirCor's patient-level `Outcome`.
-`Present + Normal` is labelled an innocent-murmur proxy and
-`Present + Abnormal` a pathological-murmur proxy. These are report groups, not
-definitive diagnoses of the separated waveform: `Outcome` can reflect clinical
-abnormality beyond the murmur itself.
+`Present + Normal Outcome` and `Present + Abnormal Outcome` are report groups,
+not murmur diagnoses: `Outcome` can reflect clinical abnormality beyond the
+murmur itself.
 
 The per-cycle `diagnostic_plot.png` uses the same compact layout for systolic
 and diastolic candidates: phase-labelled phonocardiogram, normal-heart estimate,
@@ -149,3 +148,56 @@ real audit accepted only 9/14 candidates; accepted timing agreed with CirCor in
 3/9 cases, shape agreed in 1/5 scorable cases, and only 3/14 candidates were
 stable to ±10 ms boundary perturbation. Do not expand this configuration to the
 full dataset or call its residuals clean diastolic murmurs.
+
+## Task 6: clinical Outcome classification among Murmur Present patients
+
+Task 6 evaluates patient-level clinical `Outcome` (`Normal` versus `Abnormal`)
+only among patients whose patient-level CirCor `Murmur` label is `Present`.
+The audited v1.0.3 metadata contains 179 eligible patients: 29 Normal and 150
+Abnormal. These labels are not renamed as murmur diagnoses. The scientific
+scope is clinical Outcome classification among Murmur Present patients using
+separated systolic murmur-candidate information.
+
+The frozen Task 5 summary-profile extraction contains retained features but no
+waveform or spectrogram files. Task 6 therefore has a separate resumable cache.
+It reproduces the frozen Task 5 separator for the exact eligible systolic rows
+and stores only the systolic candidate waveform. It never overwrites or mixes
+Task 5, old spectrogram, or older classification artifacts.
+
+The fixed evaluation uses five patient-stratified folds. The classical model is
+class-weighted logistic regression with the frozen core, exploratory, and
+combined feature ablations. A training-prior/majority dummy is included. The
+deep model is a compact 1D CNN, not a pretrained image network. It uses a fixed
+deterministic cap of eight training cycles per patient, an inner patient-level
+validation subset for early stopping, and mean patient probability before
+primary metrics. All preprocessing is fitted using outer-training patients
+only. QA/status fields remain in audit exports but are never model inputs.
+
+Install the optional classifier dependencies with
+`python3 -m pip install -r requirements-classification.txt`. Run the expensive
+cache and CNN jobs on the Mac; use a new run name for a new configuration and
+`--resume` only to continue the identical interrupted run:
+
+```bash
+python3 -m src.task6.prepare_cache \
+  --task5-run /Users/danggiahan/PycharmProjects/murmur_final/outputs/task5_full_extraction/task5_phase2a_full_v1 \
+  --run-name task6_systolic_cache_v1
+
+python3 -m src.task6.baseline \
+  --task5-run /Users/danggiahan/PycharmProjects/murmur_final/outputs/task5_full_extraction/task5_phase2a_full_v1 \
+  --retention-run /Users/danggiahan/PycharmProjects/murmur_final/outputs/task5_feature_retention/task5_feature_retention_v1 \
+  --run-name task6_outcome_v1
+
+python3 -m src.task6.cnn \
+  --cache-run outputs/task6_cache/task6_systolic_cache_v1 \
+  --baseline-run outputs/task6_evaluation/task6_outcome_v1 \
+  --run-name task6_outcome_cnn_v1 \
+  --resume
+```
+
+The CNN saves last/best checkpoints, fold histories, best epochs, cycle,
+recording, and patient predictions, confidence intervals, confusion matrix/ROC,
+source and artifact hashes, and a fixed comparison with the combined-feature
+classical baseline. Cross-validation is not an independent test set; results
+must be described with the small-sample and class-imbalance limitations and are
+not evidence for clinical deployment.
