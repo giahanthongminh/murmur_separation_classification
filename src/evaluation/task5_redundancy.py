@@ -22,6 +22,10 @@ from typing import Any, Final, Iterable
 import numpy as np
 import pandas as pd
 import scipy
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 from scipy.stats import rankdata, spearmanr
@@ -307,6 +311,78 @@ def complete_case_diagnostics(
     return pd.DataFrame(summary_rows), pd.DataFrame(vif_rows)
 
 
+def write_redundancy_figures(
+    destination: Path,
+    correlations: pd.DataFrame,
+    contexts: list[tuple[dict[str, str], pd.DataFrame]],
+) -> dict[str, str]:
+    """Write clustered heatmaps for every context and primary family pair plots."""
+
+    figure_dir = destination / "figures"
+    figure_dir.mkdir()
+    hashes: dict[str, str] = {}
+    indexes = {feature: index for index, feature in enumerate(TIER_A_FEATURE_COLUMNS)}
+    keys = ["aggregation_level", "murmur_phase", "analysis_stratum"]
+    for identity, group in correlations.groupby(keys, sort=True):
+        matrix = np.eye(len(TIER_A_FEATURE_COLUMNS))
+        for row in group.itertuples():
+            value = float(row.spearman_rho) if np.isfinite(row.spearman_rho) else 0.0
+            i, j = indexes[row.feature_a], indexes[row.feature_b]
+            matrix[i, j] = matrix[j, i] = value
+        tree = linkage(squareform(1 - np.abs(matrix), checks=False), method="complete")
+        order = scipy.cluster.hierarchy.leaves_list(tree)
+        ordered = matrix[np.ix_(order, order)]
+        labels = [TIER_A_FEATURE_COLUMNS[index].removeprefix("tier_a_") for index in order]
+        figure, axis = plt.subplots(figsize=(10, 9))
+        image = axis.imshow(ordered, vmin=-1, vmax=1, cmap="coolwarm")
+        axis.set_xticks(range(len(labels)), labels, rotation=90, fontsize=6)
+        axis.set_yticks(range(len(labels)), labels, fontsize=6)
+        axis.set_title(" / ".join(map(str, identity)))
+        figure.colorbar(image, ax=axis, label="Spearman rho")
+        figure.tight_layout()
+        filename = "heatmap_" + "_".join(map(str, identity)) + ".png"
+        path = figure_dir / filename
+        figure.savefig(path, dpi=160)
+        plt.close(figure)
+        hashes[str(Path("figures") / filename)] = _sha256_file(path)
+
+    primary = next(
+        (
+            frame for identity, frame in contexts
+            if identity == {
+                "aggregation_level": "primary_patient",
+                "murmur_phase": "systole",
+                "analysis_stratum": "all_valid",
+            }
+        ),
+        None,
+    )
+    families = {
+        "timing": TIER_A_FEATURE_COLUMNS[0:2],
+        "envelope": TIER_A_FEATURE_COLUMNS[3:7],
+        "spectral": TIER_A_FEATURE_COLUMNS[7:12],
+        "ridge": TIER_A_FEATURE_COLUMNS[12:14],
+    }
+    if primary is not None:
+        for family, features in families.items():
+            available = [feature for feature in features if feature in primary]
+            if len(available) < 2:
+                continue
+            axes = pd.plotting.scatter_matrix(
+                primary[available], figsize=(3 * len(available), 3 * len(available)),
+                diagonal="hist", alpha=.55, s=12,
+            )
+            figure = axes[0, 0].figure
+            figure.suptitle(f"Primary systolic all-valid: {family}", y=1.01)
+            figure.tight_layout()
+            filename = f"pairplot_primary_systole_all_valid_{family}.png"
+            path = figure_dir / filename
+            figure.savefig(path, dpi=150, bbox_inches="tight")
+            plt.close(figure)
+            hashes[str(Path("figures") / filename)] = _sha256_file(path)
+    return hashes
+
+
 def run_redundancy_analysis(
     *, phase2a_run: Path, phase2b_run: Path, run_name: str,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
@@ -335,6 +411,7 @@ def run_redundancy_analysis(
         path = destination / filename
         frame.to_csv(path, index=False)
         hashes[filename] = _sha256_file(path)
+    figure_hashes = write_redundancy_figures(destination, correlations, contexts)
     manifest = {
         "tool_version": TOOL_VERSION,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -352,6 +429,7 @@ def run_redundancy_analysis(
             "full-sample pairwise ranks"
         ),
         "artifact_sha256": hashes,
+        "figure_sha256": figure_hashes,
         "outcome_used": False,
         "prediction_pruning_permitted": False,
         "scope_statement": "Task 5 descriptive redundancy only; any Task 6 pruning must be fitted inside training folds.",
