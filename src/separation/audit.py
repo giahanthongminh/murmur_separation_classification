@@ -1223,6 +1223,10 @@ def run_audit(
     resume: bool = False,
     target_phase: str = "auto",
     recording_ids: list[str] | None = None,
+    excluded_recording_ids: list[str] | None = None,
+    report_output_dir: Path = REPORT_OUTPUT_DIR,
+    separation_output_dir: Path = SEPARATION_OUTPUT_DIR,
+    checkpoint_interval_recordings: int = 1,
 ) -> pd.DataFrame:
     if limit < 0:
         raise ValueError("limit must be non-negative; use 0 for no limit")
@@ -1236,11 +1240,21 @@ def run_audit(
         raise ValueError("target_phase must be auto, systole, or diastole")
     if resume and not run_name:
         raise ValueError("resume requires a run_name to identify its checkpoint")
+    if checkpoint_interval_recordings < 1:
+        raise ValueError("checkpoint_interval_recordings must be positive")
     ensure_output_directories()
+    report_output_dir = Path(report_output_dir).expanduser().resolve()
+    separation_output_dir = Path(separation_output_dir).expanduser().resolve()
+    report_output_dir.mkdir(parents=True, exist_ok=True)
+    separation_output_dir.mkdir(parents=True, exist_ok=True)
     if validate_first:
         validate_dataset()
     metadata_table = pd.read_csv(METADATA_PATH, dtype={"Patient ID": str})
     recording_filter = sorted(set(recording_ids or []))
+    excluded_recording_filter = sorted(set(excluded_recording_ids or []))
+    overlap = sorted(set(recording_filter) & set(excluded_recording_filter))
+    if overlap:
+        raise ValueError(f"recording IDs cannot be both included and excluded: {overlap}")
     if recording_filter:
         available = {
             row["recording_id"]: row for row in _all_recordings(metadata_table, 0)
@@ -1251,13 +1265,28 @@ def run_audit(
         recordings = [available[name] for name in recording_filter]
     else:
         recordings = (
-            _all_recordings(metadata_table, limit)
+            _all_recordings(metadata_table, 0)
             if all_recordings
             else _representative_recordings(metadata_table, limit)
         )
+    recordings = [
+        row
+        for row in recordings
+        if str(row["recording_id"]) not in excluded_recording_filter
+    ]
+    if all_recordings and limit > 0:
+        recordings = recordings[:limit]
     suffix = f"_{run_name}" if run_name else ""
-    checkpoint_path = REPORT_OUTPUT_DIR / f"separation_checkpoint{suffix}.csv"
+    checkpoint_path = report_output_dir / f"separation_checkpoint{suffix}.csv"
+    skipped_checkpoint_path = (
+        report_output_dir / f"separation_skipped_checkpoint{suffix}.csv"
+    )
+    recording_checkpoint_path = (
+        report_output_dir / f"separation_recording_checkpoint{suffix}.csv"
+    )
     summary_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
+    completed_recordings: set[str] = set()
     if resume and checkpoint_path.exists():
         checkpoint = pd.read_csv(
             checkpoint_path,
@@ -1269,6 +1298,7 @@ def run_audit(
                 "output_profile": str,
                 "target_phase_request": str,
                 "recording_filter": str,
+                "excluded_recording_filter": str,
             },
         )
         if "config_hash" in checkpoint and not checkpoint.empty:
@@ -1283,6 +1313,7 @@ def run_audit(
             "output_profile": output_profile,
             "target_phase_request": target_phase,
             "recording_filter": ",".join(recording_filter),
+            "excluded_recording_filter": ",".join(excluded_recording_filter),
         }
         if not checkpoint.empty:
             missing_identity = set(expected_identity) - set(checkpoint.columns)
@@ -1297,6 +1328,17 @@ def run_audit(
                         f"checkpoint {column} does not match the requested run"
                     )
         summary_rows = checkpoint.to_dict(orient="records")
+        if skipped_checkpoint_path.exists():
+            skipped_rows = pd.read_csv(
+                skipped_checkpoint_path,
+                dtype={"patient_id": str, "recording_id": str},
+            ).to_dict(orient="records")
+        if recording_checkpoint_path.exists():
+            completed_recordings = set(
+                pd.read_csv(
+                    recording_checkpoint_path, dtype={"recording_id": str}
+                )["recording_id"].astype(str)
+            )
     completed = {
         (
             str(row["recording_id"]),
@@ -1306,12 +1348,22 @@ def run_audit(
         for row in summary_rows
         if "recording_id" in row and "cycle_index" in row
     }
-    skipped_rows: list[dict[str, Any]] = []
     output_root = (
-        SEPARATION_OUTPUT_DIR / run_name if run_name else SEPARATION_OUTPUT_DIR
+        separation_output_dir / run_name if run_name else separation_output_dir
     )
+
+    def persist_checkpoints() -> None:
+        _write_checkpoint(summary_rows, checkpoint_path)
+        _write_checkpoint(skipped_rows, skipped_checkpoint_path)
+        _write_checkpoint(
+            [{"recording_id": value} for value in sorted(completed_recordings)],
+            recording_checkpoint_path,
+        )
+
     for recording_number, recording in enumerate(recordings, start=1):
         recording_id = recording["recording_id"]
+        if str(recording_id) in completed_recordings:
+            continue
         try:
             signal, sample_rate = _load_wav(
                 AUDIO_DIR / f"{recording_id}.wav", config.sample_rate
@@ -1326,6 +1378,12 @@ def run_audit(
             message = f"recording load failed: {exc}"
             print(f"Skipping {recording_id}: {message}")
             skipped_rows.append({**recording, "cycle_index": None, "reason": message})
+            completed_recordings.add(str(recording_id))
+            if (
+                recording_number % checkpoint_interval_recordings == 0
+                or recording_number == len(recordings)
+            ):
+                persist_checkpoints()
             continue
         systole_positions = np.flatnonzero(annotations["state"].to_numpy() == 2)
         if cycles_per_recording > 0:
@@ -1385,6 +1443,7 @@ def run_audit(
                     "requested_method": method,
                     "target_phase_request": target_phase,
                     "recording_filter": ",".join(recording_filter),
+                    "excluded_recording_filter": ",".join(excluded_recording_filter),
                     "separation_method": result.selected_method,
                     "recording_scope": (
                         "all" if all_recordings else "representative"
@@ -1420,33 +1479,38 @@ def run_audit(
                 metrics["package_saved"] = save_package
                 summary_rows.append(metrics)
                 completed.add(identity)
-        _write_checkpoint(summary_rows, checkpoint_path)
+        completed_recordings.add(str(recording_id))
+        if (
+            recording_number % checkpoint_interval_recordings == 0
+            or recording_number == len(recordings)
+        ):
+            persist_checkpoints()
         if recording_number % 25 == 0 or recording_number == len(recordings):
             print(
                 f"Completed recordings: {recording_number}/{len(recordings)}; "
                 f"segments: {len(summary_rows)}"
             )
     summary = pd.DataFrame(summary_rows)
-    destination = REPORT_OUTPUT_DIR / f"separation_summary{suffix}.csv"
+    destination = report_output_dir / f"separation_summary{suffix}.csv"
     summary.to_csv(destination, index=False)
     if "candidate_quality_status" in summary:
         accepted = summary[summary["candidate_quality_status"].eq("accepted")]
     else:
         accepted = summary.copy()
     accepted.to_csv(
-        REPORT_OUTPUT_DIR / f"separation_summary{suffix}_accepted.csv", index=False
+        report_output_dir / f"separation_summary{suffix}_accepted.csv", index=False
     )
     if "murmur_label" in accepted:
         present_accepted = accepted[accepted["murmur_label"].eq("Present")]
     else:
         present_accepted = accepted.copy()
     present_accepted.to_csv(
-        REPORT_OUTPUT_DIR
+        report_output_dir
         / f"separation_summary{suffix}_present_accepted.csv",
         index=False,
     )
     summarize_audit_quality(summary).to_csv(
-        REPORT_OUTPUT_DIR / f"separation_quality{suffix}.csv", index=False
+        report_output_dir / f"separation_quality{suffix}.csv", index=False
     )
     observation_columns = [
         "patient_id",
@@ -1475,13 +1539,13 @@ def run_audit(
         column for column in observation_columns if column in present_accepted
     ]
     present_accepted[observation_columns].to_csv(
-        REPORT_OUTPUT_DIR / f"murmur_observations{suffix}.csv", index=False
+        report_output_dir / f"murmur_observations{suffix}.csv", index=False
     )
     summarize_murmur_observations(summary).to_csv(
-        REPORT_OUTPUT_DIR / f"murmur_observation_summary{suffix}.csv", index=False
+        report_output_dir / f"murmur_observation_summary{suffix}.csv", index=False
     )
     summarize_murmur_morphology_categories(summary).to_csv(
-        REPORT_OUTPUT_DIR / f"murmur_morphology_summary{suffix}.csv", index=False
+        report_output_dir / f"murmur_morphology_summary{suffix}.csv", index=False
     )
     expert_columns = [
         column
@@ -1489,10 +1553,10 @@ def run_audit(
         if column in present_accepted
     ]
     present_accepted[expert_columns].to_csv(
-        REPORT_OUTPUT_DIR / f"murmur_expert_comparison{suffix}.csv", index=False
+        report_output_dir / f"murmur_expert_comparison{suffix}.csv", index=False
     )
     summarize_expert_agreement(summary).to_csv(
-        REPORT_OUTPUT_DIR / f"murmur_expert_agreement{suffix}.csv", index=False
+        report_output_dir / f"murmur_expert_agreement{suffix}.csv", index=False
     )
     skipped = pd.DataFrame(skipped_rows)
     if skipped.empty:
@@ -1500,9 +1564,9 @@ def run_audit(
             columns=["patient_id", "recording_id", "cycle_index", "reason"]
         )
     skipped.to_csv(
-        REPORT_OUTPUT_DIR / f"separation_skipped{suffix}.csv", index=False
+        report_output_dir / f"separation_skipped{suffix}.csv", index=False
     )
-    (REPORT_OUTPUT_DIR / f"separation_config{suffix}.json").write_text(
+    (report_output_dir / f"separation_config{suffix}.json").write_text(
         json.dumps(config.to_dict(), indent=2), encoding="utf-8"
     )
     manifest = {
@@ -1513,8 +1577,10 @@ def run_audit(
         "method": method,
         "target_phase": target_phase,
         "recording_filter": recording_filter,
+        "excluded_recording_filter": excluded_recording_filter,
         "output_profile": output_profile,
         "resume": resume,
+        "checkpoint_interval_recordings": checkpoint_interval_recordings,
         "selected_recordings": len(recordings),
         "processed_segments": len(summary),
         "skipped_segments_or_recordings": len(skipped_rows),
@@ -1523,7 +1589,7 @@ def run_audit(
             "Estimated murmur candidate; not clean-source ground truth"
         ),
     }
-    (REPORT_OUTPUT_DIR / f"separation_manifest{suffix}.json").write_text(
+    (report_output_dir / f"separation_manifest{suffix}.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
     return summary
