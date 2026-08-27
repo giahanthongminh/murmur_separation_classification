@@ -185,24 +185,24 @@ def _weighted_cluster_interval(
     y: str,
     *,
     config: RedundancyConfig,
-    key: tuple[Any, ...],
+    context_patients: np.ndarray,
+    cluster_draws: np.ndarray,
 ) -> tuple[float, float, float]:
     complete = frame[["patient_id", x, y]].dropna()
-    patients, patient_index = np.unique(complete["patient_id"].astype(str), return_inverse=True)
-    if len(complete) < config.minimum_overlap or len(patients) < 3:
+    pair_patients = complete["patient_id"].astype(str).to_numpy()
+    present_patients = np.unique(pair_patients)
+    if len(complete) < config.minimum_overlap or len(present_patients) < 3:
         return np.nan, np.nan, 1.0
+    patient_index = np.searchsorted(context_patients, pair_patients)
     rx = rankdata(complete[x].to_numpy(float), method="average")
     ry = rankdata(complete[y].to_numpy(float), method="average")
     aggregates = np.stack([
-        np.bincount(patient_index, weights=values, minlength=len(patients))
+        np.bincount(patient_index, weights=values, minlength=len(context_patients))
         for values in (np.ones(len(rx)), rx, ry, rx * rx, ry * ry, rx * ry)
     ])
-    rng = np.random.default_rng(_seed(config, key))
-    draws = rng.multinomial(
-        len(patients), np.full(len(patients), 1 / len(patients)),
-        size=config.bootstrap_replicates,
+    n, sx, sy, sx2, sy2, sxy = (
+        cluster_draws @ aggregates[index] for index in range(6)
     )
-    n, sx, sy, sx2, sy2, sxy = (draws @ aggregates[index] for index in range(6))
     covariance = sxy - sx * sy / n
     variance_x = sx2 - sx * sx / n
     variance_y = sy2 - sy * sy / n
@@ -224,6 +224,17 @@ def pairwise_correlations(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for identity, frame in contexts:
+        context_patients = np.unique(frame["patient_id"].astype(str))
+        rng = np.random.default_rng(_seed(config, identity.values()))
+        cluster_draws = (
+            rng.multinomial(
+                len(context_patients),
+                np.full(len(context_patients), 1 / len(context_patients)),
+                size=config.bootstrap_replicates,
+            )
+            if len(context_patients)
+            else np.zeros((config.bootstrap_replicates, 0), dtype=int)
+        )
         for left_index, left in enumerate(TIER_A_FEATURE_COLUMNS):
             for right in TIER_A_FEATURE_COLUMNS[left_index + 1:]:
                 complete = frame[["patient_id", left, right]].dropna()
@@ -232,7 +243,8 @@ def pairwise_correlations(
                     rho = float(spearmanr(complete[left], complete[right]).statistic)
                 low, high, failure = _weighted_cluster_interval(
                     frame, left, right, config=config,
-                    key=(*identity.values(), left, right),
+                    context_patients=context_patients,
+                    cluster_draws=cluster_draws,
                 )
                 rows.append({
                     **identity,
